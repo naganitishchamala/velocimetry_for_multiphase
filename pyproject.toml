@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "velocimetry-for-multiphase"
+version = "0.2.0"
+description = "Optical flow and PIV velocimetry for high-speed multiphase flow recordings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Naga Nitish Chamala" },
+    { name = "Sanjay Vasanth Kethanur Balasubramaniam" },
+    { name = "Olivier Coutier-Delgosha" },
+]
+keywords = ["velocimetry", "optical-flow", "PIV", "cavitation", "multiphase", "RAFT"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python>=4.8",
+    "torch>=2.0",
+    "h5py>=3.8",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+    "Pillow>=9.5",
+]
+
+[project.optional-dependencies]
+cine = ["pims>=0.6"]
+piv = ["openpiv>=0.25"]
+dev = ["pytest>=7.0"]
+all = ["pims>=0.6", "openpiv>=0.25", "pytest>=7.0"]
+
+[project.scripts]
+velocimetry-track = "tracker:main"
+
+[tool.setuptools]
+packages = ["core", "core.utils", "models", "pipeline_utils", "postprocess"]
+py-modules = ["tracker", "data", "visualize_results"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

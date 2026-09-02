@@ -1,64 +1,124 @@
+"""Chunked, streaming HDF5 output for velocity and uncertainty fields."""
+
 import h5py
 import numpy as np
-import cv2
+
+
+def block_average(field, window_height, window_width):
+    """
+    Average a field over exact, non-overlapping blocks.
+
+    Args:
+        field: (H, W, C) array.
+        window_height, window_width: block size in pixels.
+
+    Returns:
+        (H // window_height, W // window_width, C) array.  Block ``(j, i)`` is
+        the mean over source rows ``j*wh : (j+1)*wh`` and columns
+        ``i*ww : (i+1)*ww``, so its centre sits at
+        ``(j*wh + (wh-1)/2, i*ww + (ww-1)/2)``.  Use :func:`block_centers` to
+        recover those coordinates rather than assuming them.
+
+    Any trailing rows or columns that do not fill a whole block are dropped.
+    """
+    h, w = field.shape[:2]
+    n_rows = h // window_height
+    n_cols = w // window_width
+    trimmed = field[:n_rows * window_height, :n_cols * window_width]
+    reshaped = trimmed.reshape(n_rows, window_height, n_cols, window_width, -1)
+    return reshaped.mean(axis=(1, 3))
+
+
+def block_centers(n_blocks, window):
+    """Pixel coordinates of block centres produced by :func:`block_average`."""
+    return np.arange(n_blocks) * window + (window - 1) / 2.0
+
 
 class HDF5Writer:
     """
-    Handles window-averaging and chunked writing of velocity grids to an HDF5 file.
+    Window-averages and streams velocity and uncertainty fields to HDF5.
+
+    Datasets written:
+        velocity      (T, Ny, Nx, 2) float32 -- pixel displacement per frame pair
+        uncertainty   (T, Ny, Nx, 2) float32 -- |residual| in pixels
+        residual      (T, Ny, Nx, 2) float32 -- signed residual in pixels
+        valid_fraction(T, Ny, Nx)    float32 -- fraction of the block that was
+                                                informative, in [0, 1]
+
+    ``uncertainty`` is a magnitude, so it is averaged over a block directly.
+    That treats the errors within one block as fully correlated, which is the
+    appropriate assumption here: the NCC windows overlap heavily and RAFT
+    upsamples convexly from a 1/8-resolution field, so neighbouring residuals
+    are not independent.  Consumers that need a different correlation model
+    should work from ``residual`` instead.
     """
-    def __init__(self, output_path, frame_count, h, w, window_height, window_width, metadata):
+
+    def __init__(self, output_path, frame_count, h, w, window_height, window_width,
+                 metadata, compression='lzf'):
         self.output_path = output_path
         self.window_height = window_height
         self.window_width = window_width
-        
-        self.pad_height = window_height // 2
-        self.pad_width = window_width // 2
-        self.kernel = np.ones([window_height, window_width]) / (window_height * window_width)
-        
-        data_shape = (frame_count - 1, h // window_height, w // window_width, 2)
-        chunk_t = min(10, frame_count - 1)
-        chunk_shape = (chunk_t, h // window_height, w // window_width, 2)
-        
-        self.file = h5py.File(output_path, 'w')
-        self.velData = self.file.create_dataset('velocity', shape=data_shape, chunks=chunk_shape, dtype='float32')
-        self.uncertData = self.file.create_dataset('uncertainty', shape=data_shape, chunks=chunk_shape, dtype='float32')
-        
-        # Save attributes
-        for key, value in metadata.items():
-            self.velData.attrs[key] = value
 
-    def write_batch(self, start_idx, flow_batch, uncert_batch):
+        n_pairs = frame_count - 1
+        ny = h // window_height
+        nx = w // window_width
+
+        data_shape = (n_pairs, ny, nx, 2)
+        mask_shape = (n_pairs, ny, nx)
+        chunk_t = max(1, min(10, n_pairs))
+
+        self.file = h5py.File(output_path, 'w')
+
+        def make(name, shape):
+            return self.file.create_dataset(
+                name, shape=shape, chunks=(chunk_t,) + shape[1:],
+                dtype='float32', compression=compression)
+
+        self.velData = make('velocity', data_shape)
+        self.uncertData = make('uncertainty', data_shape)
+        self.residData = make('residual', data_shape)
+        self.validData = make('valid_fraction', mask_shape)
+
+        # Attributes are mirrored onto every dataset so any one of them is
+        # self-describing when read in isolation.
+        self._datasets = [self.velData, self.uncertData, self.residData, self.validData]
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            for ds in self._datasets:
+                ds.attrs[key] = value
+            self.file.attrs[key] = value
+
+    def write_batch(self, start_idx, flow_batch, uncertainty):
         """
-        Takes a batch of flow arrays and uncertainty arrays (B, H, W, 2) from the GPU, applies averaging if requested,
-        and saves them to the HDF5 file.
+        Args:
+            start_idx: index of the first frame pair in this batch.
+            flow_batch: (B, H, W, 2) array of pixel displacements.
+            uncertainty: :class:`~pipeline_utils.uncertainty.UncertaintyResult`.
         """
-        B, H, W, C = flow_batch.shape
-        
-        if self.window_width > 1 or self.window_height > 1:
-            for i in range(B):
-                flow = flow_batch[i]
-                uncert = uncert_batch[i]
-                
-                padded_arr = np.pad(flow, ((self.pad_height, self.pad_height), (self.pad_width, self.pad_width), (0, 0)), mode='reflect')
-                padded_uncert = np.pad(uncert, ((self.pad_height, self.pad_height), (self.pad_width, self.pad_width), (0, 0)), mode='reflect')
-                
-                averaged_arr = np.zeros((H // self.window_height, W // self.window_width, 2), dtype=flow.dtype)
-                averaged_uncert = np.zeros((H // self.window_height, W // self.window_width, 2), dtype=uncert.dtype)
-                
-                for channel in range(2):
-                    averaged_arr[:, :, channel] = cv2.filter2D(
-                        padded_arr[:, :, channel], -1, self.kernel
-                    )[self.pad_height:-self.pad_height:self.window_height, self.pad_width:-self.pad_width:self.window_width]
-                    
-                    averaged_uncert[:, :, channel] = cv2.filter2D(
-                        padded_uncert[:, :, channel], -1, self.kernel
-                    )[self.pad_height:-self.pad_height:self.window_height, self.pad_width:-self.pad_width:self.window_width]
-                
-                self.velData[start_idx + i, :, :, :] = averaged_arr
-                self.uncertData[start_idx + i, :, :, :] = averaged_uncert
+        batch = flow_batch.shape[0]
+        wh, ww = self.window_height, self.window_width
+
+        if ww > 1 or wh > 1:
+            for i in range(batch):
+                self.velData[start_idx + i] = block_average(flow_batch[i], wh, ww)
+                self.uncertData[start_idx + i] = block_average(uncertainty.sigma[i], wh, ww)
+                self.residData[start_idx + i] = block_average(uncertainty.residual[i], wh, ww)
+                valid = uncertainty.valid[i].astype(np.float32)[..., None]
+                self.validData[start_idx + i] = block_average(valid, wh, ww)[..., 0]
         else:
-            self.velData[start_idx:start_idx+B, :, :, :] = flow_batch
-            self.uncertData[start_idx:start_idx+B, :, :, :] = uncert_batch
+            end = start_idx + batch
+            self.velData[start_idx:end] = flow_batch
+            self.uncertData[start_idx:end] = uncertainty.sigma
+            self.residData[start_idx:end] = uncertainty.residual
+            self.validData[start_idx:end] = uncertainty.valid.astype(np.float32)
 
     def close(self):
         self.file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False

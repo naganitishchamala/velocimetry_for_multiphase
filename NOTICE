@@ -1,0 +1,4 @@
+velocimetry_for_multiphase bundles a modified copy of RAFT
+(https://github.com/princeton-vl/RAFT), Copyright (c) 2020, Princeton
+University, BSD 3-Clause. See LICENSE for the full text and a description of
+the modifications.

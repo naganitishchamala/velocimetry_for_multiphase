@@ -3,7 +3,10 @@
 
 This repository implements a high-speed, batch-processed Optical Flow and Particle Image Velocimetry (PIV) pipeline. It is specifically designed to handle large, uncompressed `.cine` and `.avi` files (up to tens of gigabytes), process them efficiently using GPU batching (RAFT) or CPU multi-processing (OpenPIV), and save the results dynamically to chunked HDF5 files to prevent memory exhaustion.
 
-It features integrated Live Uncertainty Estimation and a rich suite of post-processing and visualization tools.
+It estimates a per-pixel uncertainty alongside every flow field, flags where
+that estimate is uninformative, and propagates both into time-averaged
+statistics. Figure generation lives outside this repository; the tool writes
+self-describing HDF5 for downstream analysis to read.
 
 ---
 
@@ -36,6 +39,35 @@ graph TD
 
 ---
 
+## Installation
+
+```bash
+git clone https://github.com/ChNagaNitish/velocimetry_for_multiphase.git
+cd velocimetry_for_multiphase
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[all]"     # or ".[cine]" / ".[piv]" for just what you need
+pytest                      # confirm the install
+```
+
+RAFT weights are not bundled. Download a checkpoint into `weights/` and pass it
+with `--model`.
+
+---
+
+## Quick start
+
+```bash
+python tracker.py \
+  --path recording.cine \
+  --method raft --model weights/raft-cloudcav.pth \
+  --imgScale 0.0492 --fpsCam 130000
+```
+
+`--imgScale` (mm per pixel) and `--fpsCam` (Hz) are **required**: they cannot be
+read from the video, and a wrong value scales every result you produce. Get the
+scale from a calibration target imaged in the same optical configuration.
+
+
 ## 💡 Best Practices and Recommendations
 
 For optimal tracking accuracy and significantly easier downstream analysis, we highly recommend perfectly aligning and cropping your flow geometry *before* running the optical flow tracking.
@@ -58,7 +90,9 @@ When using RAFT (`--method raft`) on fluid experiments, we highly recommend usin
 ### 4. Prefer `.cine` over `.avi` Files
 When exporting from your high-speed camera software, export directly to the uncompressed `.cine` format instead of `.avi` whenever storage permits.
 * **Recommendation:** Supply `--path data/recording_1.cine` directly to the tracker instead of converting it to an AVI sequence.
-* **Why?** `.cine` files retain the raw 12-bit (or 14-bit) dynamic range from the camera sensor, whereas `.avi` files are heavily compressed and downmixed to 8-bit space. Maintaining the uncompressed 12-bit resolution preserves very faint density/lighting gradients in fluid structures, giving the optical flow and cross-correlation engines a significantly higher Signal-to-Noise Ratio (SNR) to lock onto.
+* **Why?** `.cine` files retain the raw 12-bit (or 14-bit) dynamic range from the camera sensor, whereas `.avi` files are heavily compressed and downmixed to 8-bit space. The pipeline scales raw counts into the 0-255 range as *floating point*, so those extra levels survive preprocessing and reach the tracker rather than being rounded away.
+* **Bit depth:** inferred from the data by default. Pass `--bit_depth 10|12|14` if your recording is unusual, or the scaling will be wrong.
+* Whether the extra dynamic range measurably improves tracking on your setup is worth testing rather than assuming.
 
 ---
 
@@ -74,6 +108,7 @@ python tracker.py \
   --method raft \
   --model weights/raft-cloudcav.pth \
   --path data/recording_1.cine \
+  --imgScale 0.0492 --fpsCam 130000 \
   --use_clahe
 ```
 
@@ -84,6 +119,7 @@ OpenPIV runs on the CPU. It features an HPC-safe parallelization strategy that a
 python tracker.py \
   --method openpiv \
   --path data/recording_1.avi \
+  --imgScale 0.0492 --fpsCam 130000 \
   --use_clahe
 ```
 
@@ -94,16 +130,27 @@ Fast, baseline optical flow based on OpenCV's internal implementations.
 python tracker.py \
   --method farneback \
   --path data/recording_1.cine \
+  --imgScale 0.0492 --fpsCam 130000 \
   --use_clahe
 ```
 
 ### Common Inference Arguments
+
+**Required**
+- `--imgScale MM_PER_PX`: Image scale in mm per pixel, from a calibration target.
+- `--fpsCam HZ`: Camera capture rate.
+
+**Optional**
 - `--frames N`: Only process the first `N` frames (useful for testing). Default `-1` (all).
 - `--roi y1 y2 x1 x2`: Crop the video before processing. E.g., `--roi 0 -1 200 800`.
 - `--use_clahe`: Apply Contrast Limited Adaptive Histogram Equalization to the video.
 - `--win_h X --win_w Y`: Average the dense flow fields spatially into `X` by `Y` blocks before saving to HDF5. Default `4 4`.
 - `--throat_loc y x`: Pass the pixel coordinates of the throat to save to metadata (required for some downstream post-processing).
 - `--rotate_angle DEG`: Pre-rotate the image by `DEG` degrees (CCW) around `--throat_loc` before cropping. Useful for aligning sloped walls horizontally. Default `0.0`. Requires `--throat_loc`.
+- `--bit_depth N`: Sensor bit depth for raw 16-bit input. Inferred if omitted.
+- `--iters N`: RAFT GRU refinement iterations. Default `20`.
+- `--uncert_window PX`: NCC window for the uncertainty estimate. Default `8`.
+- `--uncert_search PX`: Half-width of the residual search. Defaults to `uncert_window // 2`. **Increase it when per-frame displacements are large**: residuals beyond this cannot be measured and are flagged invalid rather than reported.
 
 ---
 
@@ -207,25 +254,49 @@ python visualize_results.py \
   --video data/recording_1.cine \
   --h5 data/recording_1_raft.h5 \
   --profiles 0 1.5 3 5 10 15 \
-  --angle 0 \
-  --throat_loc 331 85 \
   --frame 100
 ```
-This generates a lighter-weight `_lines.h5` containing strictly these array profiles.
+This generates a lighter-weight `_lines.h5` containing the profiles, their
+uncertainties, and the calibration and provenance of the source file. Station
+positions come from the `throat_loc_px` recorded at tracking time.
 
-### 4. Cross-Method Comparisons
+### 4. Making figures
 
-Once line profiles (`_lines.h5`) are extracted from multiple methods/cases, compare them directly. This generates publication-ready stacked plots across the specified coordinates.
+Figure generation is deliberately **not** part of this repository. `tracker.py`
+and `visualize_results.py` write self-describing HDF5; plotting scripts read it
+and live wherever the analysis they belong to lives. The schema below is the
+interface between the two, and it is versioned in `CHANGELOG.md`.
 
-```bash
-# Compare U-velocity profiles between Farneback, OpenPIV, and RAFT with uncertainty bounds
-python visualize_results.py \
-  --compare 48_fb_lines.h5 48_piv_lines.h5 48_raft_lines.h5 \
-  --labels Farneback OpenPIV RAFT-Sintel \
-  --prop u \
-  --show_uncertainty
-```
-*(Valid `--prop` options: `u`, `v`, `uu`, `uv`, `vv`, `uncert`)*
+---
+
+## 🗂️ Output format
+
+`tracker.py` writes one HDF5 file per run:
+
+| Dataset | Shape | Meaning |
+|---|---|---|
+| `velocity` | (T, Ny, Nx, 2) | pixel displacement per frame pair, (u, v) in image coordinates |
+| `uncertainty` | (T, Ny, Nx, 2) | magnitude of the residual displacement error, pixels |
+| `residual` | (T, Ny, Nx, 2) | **signed** residual error, pixels; `flow_corrected = flow - residual` |
+| `valid_fraction` | (T, Ny, Nx) | fraction of the block where the estimate is informative, 0-1 |
+
+Every dataset carries the full calibration and provenance as attributes
+(`mm_per_px`, `fps_capture`, `roi`, `window_height`, `window_width`, `method`,
+`model`, `n_frames`, `code_version`, and the CLAHE and uncertainty settings), so
+any single dataset read in isolation is self-describing.
+
+**Grid coordinates.** Block `(j, i)` covers source pixels
+`[j*win_h, (j+1)*win_h) x [i*win_w, (i+1)*win_w)` and its centre sits at
+`j*win_h + (win_h-1)/2`. Use `pipeline_utils.io.block_centers()` rather than
+recomputing it.
+
+**Validity.** The uncertainty estimator returns a number everywhere, including
+where it has no information: decorrelated regions such as vapour cores, residual
+errors larger than the search window, and reflection-padded frame borders. Those
+points are flagged in `valid_fraction` and **must** be excluded from statistics.
+`postprocess.velocity` does this; anything you write should too.
+
+---
 
 ## 🎓 Running on VT ARC HPC Cluster (Falcon)
 
@@ -258,7 +329,7 @@ source ~/NAME-OF-THE-ENV/bin/activate
 
 Install the required packages strictly after activation:
 ```bash
-pip3 install numpy scipy tqdm pyarrow pandas fastparquet opencv-python torch matplotlib h5py pims openpiv
+pip3 install -e ".[all]"
 ```
 
 ### 4. Cloning the Repository
@@ -278,7 +349,7 @@ Save the following block as `jobScript.sh`. You might have to run `chmod +x jobS
 # 
 #SBATCH -t 0-02:00:00 
 #SBATCH -N 1
-#SBACTH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --account=cavitation 
 #SBATCH --partition=a30_normal_q 
@@ -297,7 +368,9 @@ module load CUDA/12.6.0
 source "$HOME/NAME-OF-THE-ENV/bin/activate" 
 
 # Run the algorithm
-python3 tracker.py --method raft --model weights/raft-cloudcav.pth --path /home/your-pid/experiment/48.avi 
+python3 tracker.py --method raft --model weights/raft-cloudcav.pth \
+  --path /home/your-pid/experiment/48.avi \
+  --imgScale 0.0492 --fpsCam 130000
 ```
 *Note: This script asks for 1 GPU using the "cavitation" account and "a30_normal_q" partition for 2 hours.*
 
@@ -365,54 +438,84 @@ You can perform basic file management without leaving the SFTP session:
 
 ---
 
-## 📐 Appendix A: Uncertainty Quantification Methodology
+## 📐 Appendix A: Uncertainty Quantification
 
-This section details the mathematical basis for the live per-frame uncertainty estimation and its downstream propagation to time-averaged flow statistics (mean velocity and Reynolds stresses).
+### A.1 What is measured
 
-### 1. Per-Frame Uncertainty Estimation
+After the tracker predicts a displacement field, frame 2 is backward-warped onto
+frame 1. In a perfect measurement the warped frame matches frame 1 exactly. A
+local window of integer pixel shifts is searched for the peak of the Normalized
+Cross-Correlation surface, and a 3-point Gaussian fit locates that peak to
+sub-pixel precision. The offset between the peak and zero shift is the
+**residual displacement error**:
 
-The uncertainty of individual displacement vectors is computed using **NCC Peak Shift Analysis** — a correlation-based method inspired by PIV Correlation Statistics (Wieneke, 2015).
+$$ \delta = \frac{\ln R_{-1} - \ln R_{+1}}{2(\ln R_{-1} + \ln R_{+1} - 2\ln R_0)} $$
 
-After the optical flow algorithm predicts a displacement field, frame 2 is backward-warped onto frame 1 using the predicted flow. In a perfect measurement, the warped frame would exactly match frame 1. We then search a local $8 \times 8$ window of integer pixel shifts around the warped position and compute the Normalized Cross-Correlation (NCC) at each shift. The sub-pixel peak of this NCC surface — found via 3-point Gaussian fitting — indicates where the *true* best match lies. The distance between this peak and the zero-shift position (where the tracker placed it) is the uncertainty.
+This is a *signed, per-frame realised error*, not a standard deviation, and the
+distinction matters: part of it is systematic. A tracker's smoothness prior
+under-predicts the same velocity gradient in the same place every frame, and
+that component does not average away. The sign is therefore preserved
+(`flow_corrected = flow - residual`), and the two components are separated at
+averaging time:
 
-1.  **Backward Warp**: Frame 2 is warped using the predicted flow: $I_2^w = \text{Warp}(I_2, \mathbf{F}_{12})$
-2.  **NCC Search**: For each integer shift $(\Delta x, \Delta y) \in [-4, +4]$, compute the local windowed NCC:  
-    $$ R(\Delta x, \Delta y) = \text{NCC}(I_1, \text{Shift}(I_2^w, \Delta x, \Delta y)) $$
-3.  **Sub-Pixel Peak**: A 3-point Gaussian fit along each axis locates the sub-pixel peak $\delta$:  
-    $$ \delta = \frac{\ln R_{-1} - \ln R_{+1}}{2(\ln R_{-1} + \ln R_{+1} - 2 \ln R_0)} $$
-4.  **Uncertainty**: The peak shift magnitude is the per-pixel uncertainty:  
-    $$ \sigma_u(t) = |\delta_u|, \quad \sigma_v(t) = |\delta_v| $$
+$$ \delta(t) = b + \epsilon(t), \qquad b = \overline{\delta}, \qquad \mathrm{Var}(\epsilon) = \sigma_{\text{rand}}^2 $$
 
-This method directly measures how far the tracker's prediction deviates from where correlation analysis says the true match is, making it sensitive to algorithm quality rather than image texture.
+### A.2 Where the estimate is invalid
 
-### 2. Propagation to Time-Averaged Statistics
+The correlation surface is uninformative in three situations, all flagged in
+`valid_fraction` rather than reported as a confident number:
 
-When computing time-averaged properties from a sequence of $T$ frames, the per-frame measurement uncertainties $\sigma(t)$ mathematically propagate to the final statistics. We assume the measurement error $\epsilon(t)$ is modeled by a zero-mean Gaussian $\epsilon(t) \sim \mathcal{N}(0, \sigma^2(t))$.
+- the peak lies on the edge of the search window, so the true residual is larger
+  than can be measured — widen `--uncert_search` if this is common;
+- the peak correlation is too weak to locate, or the surface is not locally
+  convex;
+- the point lies within `search + window` of the frame border, where reflection
+  padding manufactures correlation and biases the estimate low.
 
-#### 2.1 Mean Velocity Uncertainty
-The time-averaged velocity $\bar{u}$ is:
-$$ \bar{u} = \frac{1}{T} \sum_{t=1}^{T} u(t) $$
+### A.3 Propagation to time averages
 
-The uncertainty of the mean is modeled to preserve the true temporal fluctuation boundaries inherent to highly unsteady multiphase flows where measurements are strongly auto-correlated. Rather than standard error decay, it uses the root-mean-square (RMS) of instantaneous tracked uncertainty:
-$$ \sigma_{\bar{u}} = \sqrt{ \frac{1}{T} \sum_{t=1}^{T} \sigma_u^2(t) } $$
+**Mean velocity.** Bias survives averaging; random error shrinks with the
+*effective* sample count, because successive frames of an unsteady flow are
+correlated:
 
-*Note: By removing strict standard error division by $\sqrt{T}$, the mean uncertainty mathematically reflects the true average instantaneous tracking precision over the window, preserving structural magnitude independent of the recording length rather than artificially collapsing to 0.*
+$$ \sigma_{\bar{u}} = \sqrt{ b^2 + \frac{\sigma_{\text{rand}}^2}{N_{\text{eff}}} }, \qquad N_{\text{eff}} = \frac{N}{2\tau_{\text{int}}} $$
 
-#### 2.2 Reynolds Stress Uncertainty
-The Reynolds normal stress $\langle u'u' \rangle$ is defined as the variance of the velocity fluctuations:
-$$ \langle u'u' \rangle = \frac{1}{T} \sum_{t=1}^{T} (u(t) - \bar{u})^2 $$
+with the integral timescale $\tau_{\text{int}}$ measured from the velocity
+autocorrelation (Benedict & Gould, *Exp. Fluids* 22, 1996). The instantaneous
+measurement precision, $\sqrt{\overline{\sigma^2}}$, is reported separately as
+`instantaneous_precision`: it answers a different question — how well a single
+frame is resolved — and does not shrink with record length.
 
-Using standard error propagation (delta method):
-$$ \sigma_{\langle u'u' \rangle} = \frac{2}{T} \sqrt{\sum_{t=1}^{T} (u(t) - \bar{u})^2 \sigma_u^2(t)} $$
+**Reynolds stresses.** Random error *inflates* a measured variance, so the noise
+floor is subtracted:
 
-Correlation terms like shear stress $\langle u'v' \rangle$ follow a similar derivation, accounting for errors in both $u$ and $v$:
-$$ \sigma_{\langle u'v' \rangle} = \frac{1}{T} \sqrt{\sum_{t=1}^{T} \left[ (v(t) - \bar{v})^2 \sigma_u^2(t) + (u(t) - \bar{u})^2 \sigma_v^2(t) \right]} $$
+$$ \langle u'u' \rangle_{\text{corrected}} = \langle u'u' \rangle_{\text{measured}} - \sigma_{\text{rand}}^2 $$
 
-### 3. Summary of Equations
+Both corrected and uncorrected values are stored. The uncertainty of the stress
+follows the delta method, with $\partial R/\partial u_k = (2/N)(u_k - \bar{u})$:
 
-| Quantity | Symbol | Uncertainty Formula |
-| :--- | :--- | :--- |
-| **Instantaneous Velocity** | $u(t)$ | $\sigma_u(t) = \|\delta_u\|$ (NCC 8×8 peak shift) |
-| **Mean Velocity** | $\bar{u}$ | $\sigma_{\bar{u}} = \sqrt{\frac{1}{T} \sum \sigma_u^2(t)}$ |
-| **Reynolds Normal Stress** | $\langle u'u' \rangle$ | $\sigma_{\langle u'u' \rangle} = \frac{2}{T} \sqrt{\sum (u-\bar{u})^2 \sigma_u^2(t)}$ |
-| **Reynolds Shear Stress** | $\langle u'v' \rangle$ | $\sigma_{\langle u'v' \rangle} = \frac{1}{T} \sqrt{\sum [ (v-\bar{v})^2 \sigma_u^2(t) + (u-\bar{u})^2 \sigma_v^2(t) ]}$ |
+$$ \sigma_{\langle u'u' \rangle} = \frac{2}{N} \sqrt{ \sum_t (u(t)-\bar{u})^2 \sigma_u^2(t) } $$
+
+$$ \sigma_{\langle u'v' \rangle} = \frac{1}{N} \sqrt{ \sum_t \left[ (v(t)-\bar{v})^2 \sigma_u^2(t) + (u(t)-\bar{u})^2 \sigma_v^2(t) \right] } $$
+
+Note the $1/N$ *outside* the square root, i.e. $1/N^2$ on the variance. These
+are verified in `tests/test_statistics.py` against the scatter the estimators
+actually exhibit under repeated noise realisations, rather than against the
+formulas themselves.
+
+### A.4 Limitations
+
+- **Not yet validated against ground truth.** A coverage test on synthetic pairs
+  with known flow — does a ±1σ band contain the true error 68% of the time? — is
+  the next step. Until then, treat σ as an indicator rather than a calibrated
+  interval.
+- **Matching error only.** The budget excludes calibration uncertainty in
+  `mm_per_px` (which enters velocity linearly and stresses quadratically),
+  timing, out-of-plane motion, and the tracker's own smoothness prior beyond
+  what the residual captures.
+- **The shear-stress formula assumes independent u and v errors.** A
+  mis-registration displaces both components together, so a cross-term is
+  missing.
+- **Errors are assumed independent between neighbouring pixels within a block.**
+  The block average of σ treats them as fully correlated instead, which is the
+  conservative choice given overlapping NCC windows.

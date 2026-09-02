@@ -10,17 +10,31 @@ sys.path.append(core_path)
 
 try:
     from raft import RAFT
-except ImportError:
-    print("Warning: RAFT module not found. Check path dependencies.")
+except ImportError as exc:  # pragma: no cover - depends on install layout
+    raise ImportError(
+        "Could not import the bundled RAFT implementation from core/. "
+        "Run from the repository root, or install the package with 'pip install -e .'."
+    ) from exc
 
 from .base import BaseOpticalFlowModel
 from pipeline_utils.uncertainty import compute_uncertainty_batch
 
 class RAFTOpticalFlow(BaseOpticalFlowModel):
     def __init__(self, model_path, device='cuda', small=False, mixed_precision=False,
-                 alternate_corr=False, **kwargs):
+                 alternate_corr=False, iters=20, keep_iters=5, uncert_window=8,
+                 uncert_max_shift=None, **kwargs):
         super().__init__(device=device)
         self.device = device
+        self.iters = iters
+        self.keep_iters = keep_iters
+        self.uncert_window = uncert_window
+        self.uncert_max_shift = uncert_max_shift
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"RAFT weights not found: {model_path}\n"
+                "Download a checkpoint into weights/ and pass it with --model."
+            )
         
         # Build argparse namespace required by original RAFT constructor
         class Args:
@@ -67,16 +81,25 @@ class RAFTOpticalFlow(BaseOpticalFlowModel):
         b_image2_pad = torch.nn.functional.pad(b_image2, pad_params, mode='replicate')
         
         with torch.no_grad():
-            _, flow_up_pad = self.model(b_image1_pad, b_image2_pad, iters=20, test_mode=True)
-            
+            outputs = self.model(b_image1_pad, b_image2_pad, iters=self.iters, test_mode=True)
+            flow_up_pad, iterates = outputs[1], (outputs[2] if len(outputs) > 2 else None)
+
             # Unpad back to original dims
             c = [pad_params[2], flow_up_pad.shape[-2] - pad_params[3],
                  pad_params[0], flow_up_pad.shape[-1] - pad_params[1]]
             flow_up = flow_up_pad[..., c[0]:c[1], c[2]:c[3]]
-            
-            # Compute dense uncertainty directly on the GPU using the batched inputs and flow
-            uncert_out = compute_uncertainty_batch(b_image1, b_image2, flow_up, window_size=8)
-            
+
+            # Spread of the final GRU iterates: a convergence-based epistemic
+            # signal that costs nothing, since RAFT computes these anyway.
+            self.last_iterate_spread = None
+            if iterates:
+                stack = torch.stack([it[..., c[0]:c[1], c[2]:c[3]] for it in iterates])
+                self.last_iterate_spread = stack.std(dim=0).permute(0, 2, 3, 1).cpu().numpy()
+
+            uncertainty = compute_uncertainty_batch(
+                b_image1, b_image2, flow_up,
+                window_size=self.uncert_window, max_shift=self.uncert_max_shift)
+
         # (B, 2, H, W) -> (B, H, W, 2)
         flow_up = flow_up.permute(0, 2, 3, 1).cpu().numpy()
-        return flow_up, uncert_out
+        return flow_up, uncertainty

@@ -1,6 +1,9 @@
 """
-Command Line Interface for visualizing optical flow results.
-Designed for research group members to use without modifying code.
+Extract physical quantities from tracker output and inspect them against the
+source video.
+
+Publication figure generation lives outside this repository: this tool writes
+self-describing HDF5, and plotting scripts read it.
 """
 
 import argparse
@@ -19,10 +22,9 @@ from postprocess import (
     compute_shedding_frequency,
     compute_cavity_metrics,
     extract_line_profiles,
-    plot_profile_comparison,
     compute_time_average_fields,
-    plot_average_contours,
-    create_profile_video
+    create_profile_video,
+    copy_provenance,
 )
 
 def main():
@@ -62,40 +64,29 @@ def main():
     
     # Quantitative Data Extraction
     parser.add_argument('--profiles', type=float, nargs='+', help="List of x-locations (in mm) from throat to extract mean velocity and Reynolds stresses.")
-    parser.add_argument('--angle', type=float, default=0.0, help="Angle (degrees) to rotate the velocity field about the throat before extraction.")
+    parser.add_argument('--angle', type=float, default=0.0,
+                        help="Deprecated. Align the field at tracking time with "
+                             "tracker.py --rotate_angle; a non-zero value here is an error.")
     parser.add_argument('--frame', type=int, default=None, help="Extract profiles at a specific instantaneous frame instead of time-averaged.")
-    
-    # Quantitative Comparison
-    parser.add_argument('--compare', nargs='+', help="List of _lines.h5 files to compare")
-    parser.add_argument('--labels', nargs='+', help="List of legends for the compared files")
-    parser.add_argument('--prop', type=str, default='u', choices=['u', 'v', 'uu', 'uv', 'vv'], help="Property to compare (e.g. u, v, uu, uv, vv). Default: u")
-    parser.add_argument('--show_uncertainty', action='store_true', help="Plot uncertainty bounds when comparing profiles.")
     
     parser.add_argument('--plot', action='store_true', help="Generate and save PNG plots for analytical flags like --frequency, --cavity, or --profiles")
 
     args = parser.parse_args()
     
-    if not (args.compare or (args.video and args.h5)):
-        print("Error: You must either provide --video and --h5 for single-file processing, or --compare for multi-file comparisons.")
-        sys.exit(1)
-        
-    if args.compare and not args.labels:
-        print("Error: You must provide --labels corresponding to the --compare files.")
-        sys.exit(1)
-        
-    if args.compare and len(args.compare) != len(args.labels):
-        print("Error: The number of --compare files and --labels must match.")
-        sys.exit(1)
-        
+    needs_video = args.quiver or args.contour or args.spacetime or args.profile_video \
+        or args.frequency or args.cavity
+    if not args.h5:
+        parser.error("--h5 is required.")
+    if needs_video and not args.video:
+        parser.error("--video is required for the requested operation.")
+    
     # Prepare the output directory
     if not os.path.exists(args.out_dir):
         os.makedirs(args.out_dir)
         print(f"Created output directory: {args.out_dir}")
         
     # Get a base name for the output files
-    if args.compare:
-        base_name = "comparison"
-    elif args.h5:
+    if args.h5:
         base_name = os.path.splitext(os.path.basename(args.h5))[0]
     elif args.video:
         base_name = os.path.splitext(os.path.basename(args.video))[0]
@@ -104,11 +95,6 @@ def main():
     
     print("\n--- Starting Post-Processing Visualization ---")
 
-    if args.compare:
-        out_path = os.path.join(args.out_dir, f"{base_name}_{args.prop}_profiles.png")
-        print(f"\n[C] Comparing {args.prop.upper()} profiles across {len(args.compare)} files --> {out_path}")
-        plot_profile_comparison(args.compare, args.labels, prop=args.prop, output_path=out_path, show_uncertainty=args.show_uncertainty)
-    
     if args.quiver:
         if args.frame is not None:
             out_path = os.path.join(args.out_dir, f"{base_name}_frame_{args.frame}_quiver.png")
@@ -157,12 +143,16 @@ def main():
     if args.frequency:
         # Load ROI automatically from HDF5 metadata
         with h5py.File(args.h5, 'r') as f:
-            if 'roi' in f['velocity'].attrs:
-                roi = tuple(f['velocity'].attrs['roi'])
-            else:
-                roi = None
-                
-        signal, f_arr, Pxx, dom_freq = compute_shedding_frequency(args.video, roi=roi)
+            attrs = f['velocity'].attrs
+            roi = tuple(attrs['roi']) if 'roi' in attrs else None
+            fps_capture = float(attrs['fps_capture']) if 'fps_capture' in attrs else None
+
+        if fps_capture is None:
+            print("Error: the HDF5 file has no 'fps_capture' attribute. "
+                  "Re-run tracker.py, or pass the capture rate explicitly.")
+            sys.exit(1)
+        
+        signal, f_arr, Pxx, dom_freq = compute_shedding_frequency(args.video, roi=roi, fps=fps_capture)
         print(f"\n[4] Dominant Shedding Frequency: {dom_freq:.2f} Hz")
         
         if args.plot:
@@ -235,33 +225,33 @@ def main():
         out_path_h5 = os.path.join(args.out_dir, f"{base_name}_average.h5")
         
         with h5py.File(out_path_h5, 'w') as fout:
+            with h5py.File(args.h5, 'r') as fin:
+                copy_provenance(dict(fin['velocity'].attrs), fout)
             for key, data in avg_fields.items():
                 fout.create_dataset(key, data=data)
-        
-        print(f"    --> Successfully saved numerical 2D averages to: {out_path_h5}")
-        
-        if args.plot:
-            print(f"    --> Generating and saving contour plots to {args.out_dir}")
-            saved_plots = plot_average_contours(avg_fields, args.out_dir, base_name)
-            for path in saved_plots:
-                print(f"        Saved: {path}")
+
+        print(f"    --> Saved 2D averages to: {out_path_h5}")
         
     if args.profiles:
         if args.frame is not None:
-            print(f"\n[6] Extracting Instantaneous Velocity Profiles at X = {args.profiles} mm (Frame {args.frame}, Rotated {args.angle}°)")
+            print(f"\n[6] Extracting instantaneous velocity profiles at X = {args.profiles} mm (frame {args.frame})")
         else:
-            print(f"\n[6] Extracting Time-Averaged Velocity Profiles at X = {args.profiles} mm (Rotated {args.angle}°)")
+            print(f"\n[6] Extracting time-averaged velocity profiles at X = {args.profiles} mm")
             
-        results, lines_h5_path = extract_line_profiles(args.h5, args.profiles, angle_deg=args.angle, frame_idx=args.frame)
-        
-        print(f"    --> Successfully saved line extractions to: {lines_h5_path}")
+        results, lines_h5_path = extract_line_profiles(
+            args.h5, args.profiles, angle_deg=args.angle, frame_idx=args.frame)
+
+        print(f"    --> Saved line extractions to: {lines_h5_path}")
         for x_wall, data in results.items():
-            print(f"        X = {x_wall} mm | Extracted {data['valid_counts'][0]} valid spatial points")
+            n = data['n_samples']
+            print(f"        X = {x_wall} mm | {int(np.nanmedian(n))} valid samples (median over the profile)")
         
-    if not (args.quiver or args.contour or args.spacetime or args.frequency or args.cavity or args.profiles or args.compare or args.average or args.profile_video):
-        print("\nNo visualization flags were provided!")
-        print("Please run with --quiver, --contour, --profile_video, --spacetime, --frequency, --cavity, --profiles, --average, and/or --compare.")
-        print("Example: python3 visualize_results.py --video myvid.avi --h5 results.h5 --profile_video")
+    if not (args.quiver or args.contour or args.spacetime or args.frequency
+            or args.cavity or args.profiles or args.average or args.profile_video):
+        print("\nNo operation requested.")
+        print("Extraction: --profiles, --average, --frequency, --cavity")
+        print("Inspection: --quiver, --contour, --profile_video, --spacetime")
+        print("Example: python3 visualize_results.py --video run.cine --h5 run_raft.h5 --average")
     else:
         print("\n--- Processing Complete ---")
 
