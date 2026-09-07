@@ -32,6 +32,9 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
+from pipeline_utils.io import (block_centers, legacy_block_centers,
+                               uses_legacy_block_centers)
+
 CHUNK = 100
 
 #: Attributes copied from a source file into every derived file.
@@ -341,9 +344,10 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
 
         throat = list(attrs['throat_loc_px']) if 'throat_loc_px' in attrs else [roi[1], 0]
 
-        # Block centres, matching pipeline_utils.io.block_average exactly.
-        x_px = roi[2] + np.arange(nx) * win_w + (win_w - 1) / 2.0
-        y_px = roi[0] + np.arange(ny) * win_h + (win_h - 1) / 2.0
+        # Block centres, matching however this file was actually written.
+        centers = legacy_block_centers if uses_legacy_block_centers(attrs) else block_centers
+        x_px = roi[2] + centers(nx, win_w)
+        y_px = roi[0] + centers(ny, win_h)
         xmm = (x_px - throat[1]) * mm_per_px
         ymm = (throat[0] - y_px) * mm_per_px
 

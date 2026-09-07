@@ -34,6 +34,38 @@ def block_centers(n_blocks, window):
     return np.arange(n_blocks) * window + (window - 1) / 2.0
 
 
+def legacy_block_centers(n_blocks, window):
+    """
+    Block centres as produced by the pre-0.2.0 writer.
+
+    That writer reflect-padded the field, ran ``cv2.filter2D`` with a
+    ``window x window`` kernel, then took a strided slice.  For an even kernel
+    OpenCV anchors at index ``window // 2`` rather than the true centre, so the
+    value stored for block *k* is the mean of source rows
+    ``[k*w - w//2, k*w - w//2 + w)`` -- centred at ``k*w + (w-1)/2 - w//2``,
+    which is half a window below where :func:`block_centers` places it.
+
+    Reading a legacy file with the current convention misplaces every profile by
+    ``window // 2`` pixels.  That is a *different physical distance for each
+    imaging configuration*, so it distorts comparisons between configurations
+    more than it distorts any single profile.
+
+    Block 0 is additionally contaminated by the reflection padding and is not
+    a clean average of any source region; no offset can repair it.
+    """
+    return np.arange(n_blocks) * window + (window - 1) / 2.0 - (window // 2)
+
+
+def uses_legacy_block_centers(attrs):
+    """
+    Whether an HDF5 file was written before the block-averaging fix.
+
+    Detected by the absence of ``code_version``, which every current tracker run
+    records.  Passing the attributes of any dataset in the file works.
+    """
+    return 'code_version' not in attrs
+
+
 class HDF5Writer:
     """
     Window-averages and streams velocity and uncertainty fields to HDF5.
