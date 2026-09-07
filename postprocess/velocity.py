@@ -37,6 +37,17 @@ from pipeline_utils.io import (block_centers, legacy_block_centers,
 
 CHUNK = 100
 
+#: Frames used to estimate the integral timescale.  It is a statistical property
+#: that converges long before a full high-speed record is exhausted, and
+#: buffering the whole record would cost gigabytes.  Frames must be contiguous:
+#: subsampling in time would change what a lag means.
+TIMESCALE_MAX_FRAMES = 4000
+
+#: Spatial stride for the field-wide timescale estimate.  The timescale varies
+#: smoothly across the grid, so it is computed on a coarse subsample and
+#: expanded back, rather than held at full resolution for every point.
+TIMESCALE_STRIDE = 4
+
 #: Attributes copied from a source file into every derived file.
 PROVENANCE_KEYS = (
     'mm_per_px', 'fps_capture', 'window_width', 'window_height', 'roi',
@@ -161,9 +172,15 @@ class _Accumulator:
     def __init__(self, shape):
         for name in self.FIELDS:
             setattr(self, name, np.zeros(shape, dtype=np.float64))
+        #: Whether any signed residual was supplied.  Without it the bias and
+        #: the random part of the error cannot be told apart, and several
+        #: quantities below are not computable.
+        self.signed = False
 
     def add(self, u, v, var_u, var_v, res_u, res_v, w):
         """Add a chunk. *w* is a 0/1 weight of the same shape as *u*."""
+        if np.any(res_u) or np.any(res_v):
+            self.signed = True
         s = lambda a: np.sum(a * w, axis=0, dtype=np.float64)
         self.n += s(np.ones_like(u))
         self.u += s(u)
@@ -204,11 +221,16 @@ class _Accumulator:
             var_rand_u = np.maximum(self.res_u2 / n - bias_u ** 2, 0.0)
             var_rand_v = np.maximum(self.res_v2 / n - bias_v ** 2, 0.0)
 
-            # Where no signed residual was available the unsigned magnitude is
-            # the only information; treat all of it as random.
-            no_signed = (self.res_u2 == 0) & (self.var_u > 0)
-            var_rand_u = np.where(no_signed, self.var_u / n, var_rand_u)
-            var_rand_v = np.where(no_signed, self.var_v / n, var_rand_v)
+            # Without the sign, bias and scatter cannot be separated.  The
+            # unsigned magnitude is all there is, so it stands in for the random
+            # part -- adequate for the uncertainty of the mean, but *not* for the
+            # noise-floor subtraction below, which it would over-subtract by
+            # however much of the residual is actually systematic.
+            if not self.signed:
+                var_rand_u = self.var_u / n
+                var_rand_v = self.var_v / n
+                bias_u = np.full_like(bias_u, np.nan)
+                bias_v = np.full_like(bias_v, np.nan)
 
             tau_u = np.ones_like(n) if tau_u is None else np.maximum(tau_u, 0.5)
             tau_v = np.ones_like(n) if tau_v is None else np.maximum(tau_v, 0.5)
@@ -226,8 +248,15 @@ class _Accumulator:
             precision_v = np.sqrt(self.var_v / n)
 
             # Random noise inflates the apparent variance; remove that floor.
-            uu_corr = uu - var_rand_u
-            vv_corr = vv - var_rand_v
+            # Only meaningful with signed residuals: an unsigned magnitude is
+            # dominated by bias, which contributes nothing to variance, so
+            # subtracting it drives the result negative.
+            if self.signed:
+                uu_corr = uu - var_rand_u
+                vv_corr = vv - var_rand_v
+            else:
+                uu_corr = np.full_like(uu, np.nan)
+                vv_corr = np.full_like(vv, np.nan)
 
             # Delta method on the stresses: Var(R) = (4/N^2) * SUM (u-ubar)^2 var_u
             var_uu = (4.0 / n ** 2) * (self.u2_var_u - 2 * umean * self.u_var_u
@@ -249,9 +278,10 @@ class _Accumulator:
             'vv_uncert': np.sqrt(np.maximum(var_vv, 0)),
             'uv_uncert': np.sqrt(np.maximum(var_uv, 0)),
             'n_samples': self.n, 'n_effective': n_eff_u,
+            'has_signed_residual': self.signed,
         }
         for key, value in out.items():
-            if key != 'n_samples':
+            if key not in ('n_samples', 'has_signed_residual'):
                 out[key] = np.where(empty, np.nan, value)
         return out
 
@@ -282,6 +312,7 @@ def compute_time_average_fields(h5_filepath, frame_start=None, frame_end=None,
 
         acc = _Accumulator((ny, nx))
         centre_series = []
+        buffered = 0
 
         for t0 in tqdm(range(start, end, CHUNK), desc='Averaging fields'):
             t1 = min(t0 + CHUNK, end)
@@ -295,12 +326,15 @@ def compute_time_average_fields(h5_filepath, frame_start=None, frame_end=None,
             acc.add(u, v, var[..., 0] * scale ** 2, var[..., 1] * scale ** 2,
                     residual[..., 0] * scale, -residual[..., 1] * scale, w)
 
-            if estimate_timescale:
-                centre_series.append(u)
+            if estimate_timescale and buffered < TIMESCALE_MAX_FRAMES:
+                centre_series.append(u[:, ::TIMESCALE_STRIDE, ::TIMESCALE_STRIDE])
+                buffered += u.shape[0]
 
         tau = None
         if estimate_timescale and centre_series:
-            tau = integral_timescale(np.concatenate(centre_series, axis=0))
+            coarse = integral_timescale(np.concatenate(centre_series, axis=0))
+            tau = np.repeat(np.repeat(coarse, TIMESCALE_STRIDE, axis=0),
+                            TIMESCALE_STRIDE, axis=1)[:ny, :nx]
 
         results = acc.reduce(tau_u=tau, tau_v=tau)
 
@@ -367,6 +401,7 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
 
         accs = [_Accumulator((ny,)) for _ in lines]
         series = [[] for _ in lines]
+        buffered = 0
 
         for t0 in tqdm(range(start, end, CHUNK), desc='Extracting profiles'):
             t1 = min(t0 + CHUNK, end)
@@ -390,8 +425,10 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
                 w = (valid[:, :, j0] & valid[:, :, j1]).astype(np.float64)
 
                 accs[li].add(u, v, var_u, var_v, res_u, res_v, w)
-                if estimate_timescale and frame_idx is None:
+                if estimate_timescale and frame_idx is None and buffered < TIMESCALE_MAX_FRAMES:
                     series[li].append(u)
+            if estimate_timescale and frame_idx is None:
+                buffered += chunk.shape[0]
 
         per_line = []
         for li in range(len(lines)):
@@ -412,6 +449,16 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
             fout.attrs['coordinate_type'] = 'wall_normal'
             fout.attrs['source_file'] = os.path.basename(h5_filepath)
             fout.attrs['instantaneous'] = int(instantaneous)
+            signed = bool(per_line[0]['has_signed_residual']) if per_line else False
+            fout.attrs['has_signed_residual'] = int(signed)
+            if not signed:
+                fout.attrs['uncertainty_note'] = (
+                    'Source file carries only the unsigned residual magnitude, so '
+                    'bias and random error could not be separated. The noise-floor '
+                    'correction and the bias field are therefore absent, and '
+                    'mean_velocity_uncertainty treats the whole residual as random '
+                    '- which understates it to the extent the residual is '
+                    'systematic. Re-track to obtain the signed residual.')
             if instantaneous:
                 fout.attrs['frame_index'] = frame_idx
 
@@ -437,9 +484,10 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
                 unc_ds.attrs['components'] = ['sigma_u_parallel', 'sigma_v_normal']
                 unc_ds.attrs['definition'] = 'sqrt(bias^2 + var_random / N_eff)'
 
-                grp.create_dataset(
-                    'mean_velocity_bias',
-                    data=np.stack([res['mean_u_bias'], res['mean_v_bias']], axis=1))
+                if res['has_signed_residual']:
+                    grp.create_dataset(
+                        'mean_velocity_bias',
+                        data=np.stack([res['mean_u_bias'], res['mean_v_bias']], axis=1))
                 grp.create_dataset(
                     'instantaneous_precision',
                     data=np.stack([res['precision_u'], res['precision_v']], axis=1))
@@ -452,12 +500,13 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
                     rey.attrs['units'] = 'm^2/s^2'
                     rey.attrs['noise_corrected'] = 0
 
-                    corr = grp.create_dataset(
-                        'reynolds_stresses_noise_corrected',
-                        data=np.stack([res['uu_noise_corrected'], res['uv'],
-                                       res['vv_noise_corrected']], axis=1))
-                    corr.attrs['components'] = ['uu', 'uv', 'vv']
-                    corr.attrs['noise_corrected'] = 1
+                    if res['has_signed_residual']:
+                        corr = grp.create_dataset(
+                            'reynolds_stresses_noise_corrected',
+                            data=np.stack([res['uu_noise_corrected'], res['uv'],
+                                           res['vv_noise_corrected']], axis=1))
+                        corr.attrs['components'] = ['uu', 'uv', 'vv']
+                        corr.attrs['noise_corrected'] = 1
 
                     rey_unc = grp.create_dataset(
                         'reynolds_stresses_uncertainty',

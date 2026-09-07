@@ -126,3 +126,41 @@ def test_integral_timescale_detects_correlation():
 
     assert tau_white < 3.0
     assert tau_corr > 5.0 * tau_white
+
+
+def test_noise_correction_is_withheld_without_signed_residuals():
+    """
+    An unsigned residual magnitude is dominated by bias, which contributes
+    nothing to variance. Subtracting it as if it were noise drives the Reynolds
+    stress negative, so the correction must not be attempted at all.
+    """
+    n = 500
+    rng = np.random.default_rng(7)
+    u = rng.normal(15.0, 1.0, (n, 1))
+    zeros = np.zeros_like(u)
+    magnitude = np.full_like(u, 2.5)      # |residual|, mostly systematic
+
+    acc = _Accumulator((1,))
+    acc.add(u, zeros, magnitude ** 2, magnitude ** 2, zeros, zeros, np.ones_like(u))
+    out = acc.reduce()
+
+    assert out['has_signed_residual'] is False
+    assert np.isnan(out['uu_noise_corrected'][0])
+    assert np.isnan(out['mean_u_bias'][0])
+    assert np.isfinite(out['uu'][0]) and out['uu'][0] > 0
+
+
+def test_noise_correction_applies_when_the_sign_is_present():
+    n = 4000
+    rng = np.random.default_rng(8)
+    truth = rng.normal(15.0, 1.0, (n, 1))
+    noise = rng.normal(0.0, 0.4, (n, 1))
+    u = truth + noise
+    zeros = np.zeros_like(u)
+
+    acc = _Accumulator((1,))
+    acc.add(u, zeros, noise ** 2, zeros, noise, zeros, np.ones_like(u))
+    out = acc.reduce()
+
+    assert out['has_signed_residual'] is True
+    assert abs(out['uu_noise_corrected'][0] - truth.var()) < abs(out['uu'][0] - truth.var())
