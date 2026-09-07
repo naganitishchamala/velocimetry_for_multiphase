@@ -164,3 +164,23 @@ def test_noise_correction_applies_when_the_sign_is_present():
 
     assert out['has_signed_residual'] is True
     assert abs(out['uu_noise_corrected'][0] - truth.var()) < abs(out['uu'][0] - truth.var())
+
+
+def test_mean_uncertainty_stays_finite_without_signed_residuals():
+    """
+    An unknown bias must drop out of the sum, not poison it. Reporting the bias
+    field as NaN is right; letting that NaN reach sigma is not.
+    """
+    n = 500
+    rng = np.random.default_rng(11)
+    u = rng.normal(15.0, 1.0, (n, 1))
+    zeros = np.zeros_like(u)
+    magnitude = np.full_like(u, 0.4)
+
+    acc = _Accumulator((1,))
+    acc.add(u, zeros, magnitude ** 2, magnitude ** 2, zeros, zeros, np.ones_like(u))
+    out = acc.reduce()
+
+    assert np.isnan(out['mean_u_bias'][0])
+    assert np.isfinite(out['mean_u_uncert'][0])
+    assert out['mean_u_uncert'][0] > 0

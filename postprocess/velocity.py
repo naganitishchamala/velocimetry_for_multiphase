@@ -226,9 +226,16 @@ class _Accumulator:
             # part -- adequate for the uncertainty of the mean, but *not* for the
             # noise-floor subtraction below, which it would over-subtract by
             # however much of the residual is actually systematic.
+            # The bias *term* and the reported bias *field* differ when the sign
+            # is missing: the term drops out of the sum (an unknown contribution
+            # cannot be added), while the field is reported as NaN so nobody
+            # mistakes "not measured" for "measured to be zero".
+            bias_u_term, bias_v_term = bias_u, bias_v
             if not self.signed:
                 var_rand_u = self.var_u / n
                 var_rand_v = self.var_v / n
+                bias_u_term = np.zeros_like(bias_u)
+                bias_v_term = np.zeros_like(bias_v)
                 bias_u = np.full_like(bias_u, np.nan)
                 bias_v = np.full_like(bias_v, np.nan)
 
@@ -239,8 +246,8 @@ class _Accumulator:
 
             # Uncertainty of the mean: a bias that survives averaging, plus a
             # random part that shrinks with the effective sample count.
-            umean_uncert = np.sqrt(bias_u ** 2 + var_rand_u / n_eff_u)
-            vmean_uncert = np.sqrt(bias_v ** 2 + var_rand_v / n_eff_v)
+            umean_uncert = np.sqrt(bias_u_term ** 2 + var_rand_u / n_eff_u)
+            vmean_uncert = np.sqrt(bias_v_term ** 2 + var_rand_v / n_eff_v)
 
             # Instantaneous measurement precision: a different quantity, kept
             # because it answers "how well is one frame resolved?".
