@@ -16,6 +16,13 @@ The two propagate differently and are reported separately:
   ``1 / sqrt(N_eff)``, where ``N_eff = N / (2 * tau_int)`` accounts for the
   measurements being autocorrelated in time.
 
+Separating the two requires the *signed* residual.  Given only its magnitude,
+the whole residual is treated as bias: that is the conservative limit, since
+averaging can never increase an uncertainty, and it is what this data supports.
+Note that ``sigma_ubar`` can never exceed the instantaneous precision --
+averaging either helps or does nothing -- but it can equal it, and does whenever
+the error is systematic.
+
 For statistics of the fluctuations, random measurement error also *inflates* the
 apparent variance: ``E[<u'u'>_measured] = <u'u'>_true + sigma_rand^2``.  That
 noise floor is subtracted, and both corrected and uncorrected values are stored
@@ -226,16 +233,26 @@ class _Accumulator:
             # part -- adequate for the uncertainty of the mean, but *not* for the
             # noise-floor subtraction below, which it would over-subtract by
             # however much of the residual is actually systematic.
-            # The bias *term* and the reported bias *field* differ when the sign
-            # is missing: the term drops out of the sum (an unknown contribution
-            # cannot be added), while the field is reported as NaN so nobody
-            # mistakes "not measured" for "measured to be zero".
+            # Without the sign, bias and scatter cannot be separated at all.
+            # The two limits differ by sqrt(N_eff) -- a factor of ~16 here -- so
+            # the choice is not a detail:
+            #
+            #   all random  -> sigma_ubar = sigma_inst / sqrt(N_eff)
+            #   all bias    -> sigma_ubar = sigma_inst
+            #
+            # The unsigned residual is taken as wholly systematic, which is the
+            # conservative reading (averaging can only reduce an uncertainty, so
+            # this is an upper bound) and the one the data supports: the
+            # residual variance exceeds the measured velocity variance at nearly
+            # every point, which is impossible for an error that is random in
+            # time. The bias field itself is still reported as NaN, because its
+            # sign -- and therefore any correction -- remains unknown.
             bias_u_term, bias_v_term = bias_u, bias_v
             if not self.signed:
-                var_rand_u = self.var_u / n
-                var_rand_v = self.var_v / n
-                bias_u_term = np.zeros_like(bias_u)
-                bias_v_term = np.zeros_like(bias_v)
+                var_rand_u = np.zeros_like(self.var_u)
+                var_rand_v = np.zeros_like(self.var_v)
+                bias_u_term = np.sqrt(self.var_u / n)
+                bias_v_term = np.sqrt(self.var_v / n)
                 bias_u = np.full_like(bias_u, np.nan)
                 bias_v = np.full_like(bias_v, np.nan)
 

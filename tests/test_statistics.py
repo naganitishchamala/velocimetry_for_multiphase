@@ -184,3 +184,42 @@ def test_mean_uncertainty_stays_finite_without_signed_residuals():
     assert np.isnan(out['mean_u_bias'][0])
     assert np.isfinite(out['mean_u_uncert'][0])
     assert out['mean_u_uncert'][0] > 0
+
+
+def test_unsigned_residual_is_treated_as_bias_not_scatter():
+    """
+    Without the sign, bias and scatter are indistinguishable and the two limits
+    differ by sqrt(N_eff). The conservative limit is the right default:
+    averaging can never increase an uncertainty, so treating the residual as
+    systematic is an upper bound, whereas treating it as random understates it
+    by sqrt(N_eff) whenever the error is in fact systematic.
+    """
+    n = 2000
+    rng = np.random.default_rng(13)
+    u = rng.normal(15.0, 1.0, (n, 1))
+    zeros = np.zeros_like(u)
+    magnitude = np.full_like(u, 0.5)          # |residual|, sign unknown
+
+    acc = _Accumulator((1,))
+    acc.add(u, zeros, magnitude ** 2, magnitude ** 2, zeros, zeros, np.ones_like(u))
+    out = acc.reduce()
+
+    assert out['has_signed_residual'] is False
+    assert out['mean_u_uncert'][0] == pytest.approx(0.5, abs=0.01)
+    assert out['mean_u_uncert'][0] == pytest.approx(out['precision_u'][0], abs=1e-9)
+
+
+def test_signed_residual_still_averages_its_random_part_down():
+    """With the sign available, a genuinely random error does average down."""
+    n = 4000
+    rng = np.random.default_rng(14)
+    truth = rng.normal(15.0, 1.0, (n, 1))
+    noise = rng.normal(0.0, 0.5, (n, 1))
+    zeros = np.zeros_like(truth)
+
+    acc = _Accumulator((1,))
+    acc.add(truth + noise, zeros, noise ** 2, zeros, noise, zeros, np.ones_like(truth))
+    out = acc.reduce()
+
+    assert out['has_signed_residual'] is True
+    assert out['mean_u_uncert'][0] < 0.2 * out['precision_u'][0]
