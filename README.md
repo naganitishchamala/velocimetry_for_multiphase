@@ -267,6 +267,30 @@ and `visualize_results.py` write self-describing HDF5; plotting scripts read it
 and live wherever the analysis they belong to lives. The schema below is the
 interface between the two, and it is versioned in `CHANGELOG.md`.
 
+### 5. Measuring endpoint error on synthetic pairs
+
+`evaluate_epe.py` runs RAFT, Farneback and OpenPIV on image pairs with known
+displacement and reports the endpoint error. Each method goes through the same
+wrapper and preprocessing that `tracker.py` uses on real recordings, and all
+methods are scored on the same pixels.
+
+```bash
+python evaluate_epe.py --pairs test_pairs.txt --out_dir epe_results \
+  --methods raft farneback openpiv \
+  --raft_models weights/raft-cloudcav.pth weights/raft-sintel.pth \
+  --use_clahe
+```
+
+`test_pairs.txt` lists `img1 img2 flow.flo` per line (or use `--data_dir`).
+Ground-truth `.flo` files are read as stored, with v positive down the image
+rows, and are never flipped. Pixels where the ground truth is exactly zero
+(outside the simulated domain, no-slip walls) are excluded. Gaps a method
+leaves (NaN) are reported as `coverage` rather than dropped, and
+`epe_mean_gaps_as_zero` charges them as zero motion. Results are given per
+block of frame numbers (`--block_size`) and pooled, next to a `zero-motion`
+baseline that any working method must beat. `run_info.json` records the
+library versions and the SHA-256 of each RAFT checkpoint.
+
 ---
 
 ## 🗂️ Output format

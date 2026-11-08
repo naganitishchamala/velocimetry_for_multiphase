@@ -42,7 +42,7 @@ velocimetry-track = "tracker:main"
 
 [tool.setuptools]
 packages = ["core", "core.utils", "models", "pipeline_utils", "postprocess"]
-py-modules = ["tracker", "data", "visualize_results"]
+py-modules = ["tracker", "data", "visualize_results", "evaluate_epe"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

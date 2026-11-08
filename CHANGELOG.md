@@ -40,6 +40,13 @@
 
 ### Added
 
+- **`evaluate_epe.py`**: endpoint error of RAFT, Farneback and OpenPIV on
+  synthetic pairs with known flow, through the pipeline's own wrappers and
+  preprocessing. One ground-truth mask for every method, gaps counted as lost
+  coverage instead of being dropped, per-block and pooled statistics, a
+  zero-motion baseline, and a record of library versions and checkpoint
+  hashes. The ground truth is read as stored; the earlier evaluation scripts
+  flipped it.
 - `residual` (signed) and `valid_fraction` datasets; points where the estimator
   has no information are flagged rather than reported as confident.
 - Configurable uncertainty search half-width (`--uncert_search`). Residuals
