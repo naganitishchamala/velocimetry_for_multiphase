@@ -2,6 +2,17 @@
 
 ## 0.2.0 — unreleased
 
+### Changed
+
+- **New `raft-cloudcav.pth` weights.** Fine-tuned from `raft-sintel.pth` on
+  synthetic image pairs rendered from LES of the Venturi on the mid-plane and
+  both quarter-planes, trained on the first four fifths of the time steps
+  (723 pairs) and tested on the last fifth (183 pairs). AdamW, learning rate
+  2e-5, weight decay 1e-5, 3000 steps, batch 8, gamma 0.85. Test end-point
+  error 0.114 px against 0.239 px for `raft-sintel.pth` (8 px border left out,
+  24 iterations). Replaces the October 2025 weights.
+  SHA-256 `b6d4ebe1b6b98e515dc0cd1a5a84aa98f63d0133b9a387a36119f30ab8ce43a3`.
+
 ### Corrected
 
 - **Reynolds-stress uncertainty was inflated by √N.** An uncommitted local edit
