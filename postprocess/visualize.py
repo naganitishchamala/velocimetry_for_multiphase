@@ -1,9 +1,34 @@
+"""Overlay renderers for inspecting velocity fields against the source video."""
+
 import cv2
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
 from pipeline_utils.preprocessing import rotate_frame, crop_frame
+
+
+def block_center(index, window):
+    """Pixel centre of averaging block *index*, matching pipeline_utils.io."""
+    return index * window + (window - 1) / 2.0
+
+
+def _draw_arrows(frame, u, v, win_h, win_w, skip, scale):
+    """Draw the vector field, anchored at true block centres."""
+    ny, nx = u.shape
+    for j in range(0, ny, skip):
+        for i in range(0, nx, skip):
+            if not (np.isfinite(u[j, i]) and np.isfinite(v[j, i])):
+                continue
+            # round, not truncate: int() would silently drop every vector
+            # shorter than one pixel, hiding slow regions entirely.
+            du = int(round(float(u[j, i]) * scale))
+            dv = int(round(float(v[j, i]) * scale))
+            y_loc = int(round(block_center(j, win_h)))
+            x_loc = int(round(block_center(i, win_w)))
+            cv2.arrowedLine(frame, (x_loc, y_loc), (x_loc + du, y_loc + dv),
+                            (0, 0, 255), 1, tipLength=0.3)
 
 def _get_processed_metadata(velData, width, height):
     """Helper to extract and compute geometric properties from HDF5 attributes."""
@@ -54,20 +79,8 @@ def create_quiver_video(video_path, h5_filepath, output_path, scale=2.0, skip=16
             
             frame = _align_frame(frame, throat_loc, rotate_angle, roi)
             
-            u = velData[k, :, :, 0]
-            v = velData[k, :, :, 1]
-            Ny, Nx = u.shape
-             
-            for j in range(0, Ny, skip):
-                for i in range(0, Nx, skip):
-                    du = int(u[j, i] * scale)
-                    dv = int(v[j, i] * scale)
-                    
-                    if du != 0 or dv != 0:
-                        y_loc = (j * win_h) + (win_h // 2)
-                        x_loc = (i * win_w) + (win_w // 2)
-                        cv2.arrowedLine(frame, (x_loc, y_loc), (x_loc + du, y_loc + dv), (0, 0, 255), 1, tipLength=0.3)
-                        
+            _draw_arrows(frame, velData[k, :, :, 0], velData[k, :, :, 1],
+                         win_h, win_w, skip, scale)
             out.write(frame)
             
     cap.release()
@@ -93,17 +106,8 @@ def create_quiver_image(video_path, h5_filepath, output_path, frame_idx=0, scale
         
         u = velData[frame_idx, :, :, 0]
         v = velData[frame_idx, :, :, 1]
-        Ny, Nx = u.shape
-        
-    for j in range(0, Ny, skip):
-        for i in range(0, Nx, skip):
-            du = int(u[j, i] * scale)
-            dv = int(v[j, i] * scale)
-            if du != 0 or dv != 0:
-                y_loc = (j * win_h) + (win_h // 2)
-                x_loc = (i * win_w) + (win_w // 2)
-                cv2.arrowedLine(frame, (x_loc, y_loc), (x_loc + du, y_loc + dv), (0, 0, 255), 1, tipLength=0.3)
-                
+
+    _draw_arrows(frame, u, v, win_h, win_w, skip, scale)
     cv2.imwrite(output_path, frame)
     cap.release()
 
@@ -152,17 +156,22 @@ def create_contour_video(video_path, h5_filepath, dataset_name, output_path, alp
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     with h5py.File(h5_filepath, 'r') as f:
-        data = f[dataset_name][:]
-        velData = f['velocity'] if 'velocity' in f else f[dataset_name]
+        data = f[dataset_name]
+        velData = f['velocity'] if 'velocity' in f else data
         roi, rotate_angle, throat_loc, win_w, win_h, out_height, out_width = _get_processed_metadata(velData, width, height)
-        
+
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
-        
-        flat_data = data.flatten()
-        flat_data = flat_data[np.isfinite(flat_data)]
-        vmin, vmax = np.percentile(flat_data, [5, 95])
+
         frames = data.shape[0]
+
+        # Percentile range from a subsample: the full dataset can be many GB.
+        sample_idx = np.unique(np.linspace(0, frames - 1, min(frames, 50)).astype(int))
+        sample = np.concatenate([np.asarray(data[i]).ravel() for i in sample_idx])
+        sample = sample[np.isfinite(sample)]
+        vmin, vmax = np.percentile(sample, [5, 95]) if sample.size else (0.0, 1.0)
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
         
         ret, _ = cap.read()
         
@@ -172,7 +181,7 @@ def create_contour_video(video_path, h5_filepath, dataset_name, output_path, alp
             
             frame = _align_frame(frame, throat_loc, rotate_angle, roi)
                 
-            scalar_field = data[k]
+            scalar_field = np.asarray(data[k])
             if scalar_field.ndim == 3 and scalar_field.shape[-1] == 2:
                 scalar_field = np.linalg.norm(scalar_field, axis=2)
                 
@@ -215,25 +224,26 @@ def create_profile_video(video_path, h5_filepath, output_path, num_profiles=10, 
     extent = [0, out_width, out_height, 0]
     
     x_indices = np.linspace(0, Nx - 1, num_profiles, dtype=int)
-    y_px = (np.arange(Ny) * win_h) + (win_h / 2.0)
+    y_px = block_center(np.arange(Ny), win_h)
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
-    profile_scale_px = 2.0 
+    profile_scale_px = 2.0
     ret, _ = cap.read()
-    
+
     print(f"Generating profile intersection animation at {fps} fps...")
-    for k in tqdm(range(n_frames), desc="Rendering Profile Video"):
+    handle = h5py.File(h5_filepath, 'r')
+    try:
+      for k in tqdm(range(n_frames), desc="Rendering Profile Video"):
         ret, frame = cap.read()
         if not ret: break
-            
+
         frame = _align_frame(frame, throat_loc, rotate_angle, roi)
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        vel = handle['velocity'][k]
+        uncert = handle['uncertainty'][k] if 'uncertainty' in handle else None
         
-        with h5py.File(h5_filepath, 'r') as f:
-            vel = f['velocity'][k]
-            uncert = f['uncertainty'][k] if 'uncertainty' in f else None
-            
         u = vel[..., 0] * scale_fac
         v = -vel[..., 1] * scale_fac
         mag = np.sqrt(u**2 + v**2)
@@ -249,7 +259,7 @@ def create_profile_video(video_path, h5_filepath, output_path, num_profiles=10, 
         cbar.set_label('Velocity Magnitude (m/s)')
         
         for idx_x in x_indices:
-            x_base_px = (idx_x * win_w) + (win_w / 2.0)
+            x_base_px = block_center(idx_x, win_w)
             u_prof = u[:, idx_x]
             
             ax.axvline(x=x_base_px, color='white', linestyle='--', alpha=0.4)
@@ -279,204 +289,9 @@ def create_profile_video(video_path, h5_filepath, output_path, num_profiles=10, 
             
         out.write(img_bgr)
         plt.close(fig)
-        
+    finally:
+        handle.close()
+
     cap.release()
     if out is not None:
         out.release()
-
-
-def set_journal_style(column_type='single'):
-    """
-    Applies professional style and sets precise dimensions for papers.
-    column_type: 'single' (3.5"), 'double' (7.0"), or 'half'
-    """
-    if column_type == 'double':
-        width = 7.0
-    elif column_type == 'half':
-        width = 4.5
-    else: 
-        width = 3.5 
-
-    height = width / 1.618 
-    plt.style.use('seaborn-v0_8-paper')
-    plt.rcParams.update({
-        "figure.figsize": (width, height),
-        "font.family": "serif", 
-        "font.serif": ["Computer Modern Roman"],
-        "font.size": 10,
-        "axes.labelsize": 10,
-        "xtick.labelsize": 8,
-        "ytick.labelsize": 8,
-        "legend.fontsize": 8,
-        "text.usetex": True,
-        "text.latex.preamble": r'\usepackage{amsmath} \usepackage{amssymb}',
-        "axes.linewidth": 0.6,
-        "lines.linewidth": 1,
-        "xtick.major.width": 0.6,
-        "ytick.major.width": 0.6,
-        "legend.frameon": True,
-        "legend.framealpha": 1.0, 
-        "legend.fancybox": False, 
-        "legend.edgecolor": "black",
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight", 
-        "savefig.pad_inches": 0.05
-    })
-
-def plot_profile_comparison(paths, legends, prop='u', output_path=None, show_uncertainty=False):
-    """
-    Plots comparison profiles from multiple _lines.h5 files.
-
-    Creates a grid of subplots (one per x-location). Each subplot shows
-    the chosen property vs. y-coordinate for every file, labelled with
-    the supplied legends. By default, time-averaged profile plots will hide
-    uncertainty bounds unless show_uncertainty is True.
-
-    Args:
-        paths:   List of paths to _lines.h5 files produced by extract_line_profiles.
-        legends: Display label for each file (same order as *paths*).
-        prop:    Property to compare - 'u', 'v', 'uu', 'uv', or 'vv'.
-        output_path: Optional path to save the figure. If None, plt.show().
-        show_uncertainty: Whether to shade uncertainty bounds along the profiles.
-    """
-    prop_map = {
-        'u':  ('mean_velocity', 0),
-        'v':  ('mean_velocity', 1),
-        'uu': ('reynolds_stresses', 0),
-        'uv': ('reynolds_stresses', 1),
-        'vv': ('reynolds_stresses', 2),
-    }
-    if prop not in prop_map:
-        raise ValueError(f"Unknown property '{prop}'. Valid: {list(prop_map.keys())}")
-    ds_name, col_idx = prop_map[prop]
-
-    # Labels for axes
-    prop_labels = {
-        'u':  r'$\bar{u}$ (m/s)',
-        'v':  r'$\bar{v}$ (m/s)',
-        'uu': r"$\overline{u'u'}$ (m$^2$/s$^2$)",
-        'uv': r"$\overline{u'v'}$ (m$^2$/s$^2$)",
-        'vv': r"$\overline{v'v'}$ (m$^2$/s$^2$)",
-    }
-
-    # Discover all x-location groups across files
-    all_x_locs = set()
-    for p in paths:
-        with h5py.File(p, 'r') as f:
-            all_x_locs.update(k for k in f.keys() if k.startswith('x_location_'))
-
-    def _parse_x(name):
-        return float(name.replace('x_location_', '').replace('_', '.', 1))
-
-    x_locs = sorted(list(all_x_locs), key=_parse_x)
-    if not x_locs:
-        print("No x-location groups found in provided files.")
-        return
-
-    n = len(x_locs)
-    
-    set_journal_style('double')
-    
-    # Re-apply the user's specific constrained layout pattern from OldavgPlot
-    fig, axes = plt.subplots(1, n, figsize=(5.0, 3.5), sharey=True, squeeze=False, layout='constrained')
-
-    uncert_map = {
-        'u':  ('mean_velocity_uncertainty', 0),
-        'v':  ('mean_velocity_uncertainty', 1),
-        'uu': ('reynolds_stresses_uncertainty', 0),
-        'uv': ('reynolds_stresses_uncertainty', 1),
-        'vv': ('reynolds_stresses_uncertainty', 2),
-    }
-    
-    # Safe lookup incase it doesn't match
-    unc_ds_name, unc_col_idx = uncert_map.get(prop, (None, None))
-
-    for idx, loc_name in enumerate(x_locs):
-        ax = axes[0][idx]
-        x_val = _parse_x(loc_name)
-
-        for p, label in zip(paths, legends):
-            try:
-                with h5py.File(p, 'r') as f:
-                    if loc_name not in f:
-                        continue
-                    grp = f[loc_name]
-                    y = np.array(grp['y_coordinates'])
-                    data = np.array(grp[ds_name][:, col_idx])
-
-                    npts = min(len(y), len(data))
-                    y = y[:npts]
-                    data = data[:npts]
-
-                    line, = ax.plot(data, y, label=label, linewidth=1.5)
-
-                    if show_uncertainty and (unc_ds_name in grp):
-                        sigma = np.array(grp[unc_ds_name][:npts, unc_col_idx])
-                        ax.fill_betweenx(y, data - sigma, data + sigma, alpha=0.2, color=line.get_color())
-            except Exception as e:
-                print(f"Error reading {p}: {e}")
-
-        ax.set_title(f'X = {x_val} mm', pad=10)
-        ax.set_xlabel(prop_labels.get(prop, prop.upper()))
-        ax.grid(True, linestyle='--', alpha=0.7)
-        if idx == 0:
-            ax.set_ylabel('Wall-Normal Distance (mm)')
-
-    # Exact match of oldavgPlot.py legend extraction and rendering rules
-    handles, labels = [], []
-    for ax_flat in axes.flatten():
-        h, l = ax_flat.get_legend_handles_labels()
-        handles.extend(h)
-        labels.extend(l)
-        
-    by_label = dict(zip(labels, handles))
-    if by_label:
-        fig.legend(by_label.values(), by_label.keys(), loc='outside lower center', ncol=len(by_label), frameon=False)
-
-    fig.suptitle(f'Comparison: {prop.upper()} Profile')
-
-    if output_path:
-        fig.savefig(output_path, transparent=True)
-    else:
-        plt.show()
-    plt.close()
-
-def plot_average_contours(avg_fields, output_dir, base_name):
-    """
-    Plots the time-averaged 2D spatial contours for Mean Velocities and 
-    Reynolds Stresses computed from `compute_time_average_fields`.
-    """
-    import os
-    
-    props = {
-        'mean_u': r'$\bar{U}$ (m/s)',
-        'mean_v': r'$\bar{V}$ (m/s)',
-        'uu': r"$\overline{u'u'}$ (m$^2$/s$^2$)",
-        'vv': r"$\overline{v'v'}$ (m$^2$/s$^2$)",
-        'uv': r"$\overline{u'v'}$ (m$^2$/s$^2$)"
-    }
-    
-    saved_paths = []
-    
-    for key, label in props.items():
-        if key in avg_fields:
-            data = avg_fields[key]
-            out_path = os.path.join(output_dir, f"{base_name}_avg_contour_{key}.png")
-            
-            # Create a 2D physical map
-            plt.figure(figsize=(10, 5), layout='constrained')
-            
-            # Using contourf with inverted layout since row 0 is the top of the image mathematically
-            # 'data' is structured as (Ny, Nx).
-            contour = plt.contourf(data, levels=30, cmap='jet')
-            plt.gca().invert_yaxis() # Ensure image renders geometrically top-down
-            
-            plt.colorbar(contour, label=label)
-            plt.title(f'Time-Averaged Contour: {label}')
-            plt.axis('off')
-            
-            plt.savefig(out_path, dpi=300, transparent=True)
-            plt.close()
-            saved_paths.append(out_path)
-            
-    return saved_paths

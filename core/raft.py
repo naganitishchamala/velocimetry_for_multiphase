@@ -83,7 +83,8 @@ class RAFT(nn.Module):
         return up_flow.reshape(N, 2, 8*H, 8*W)
 
 
-    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
+    def forward(self, image1, image2, iters=12, flow_init=None, upsample=True,
+                test_mode=False, keep_iters=5):
         """ Estimate optical flow between pair of frames """
 
         image1 = 2 * (image1 / 255.0) - 1.0
@@ -139,6 +140,10 @@ class RAFT(nn.Module):
             flow_predictions.append(flow_up)
 
         if test_mode:
-            return coords1 - coords0, flow_up
-            
+            # The trailing iterates are returned as well: their spread is a
+            # free, convergence-based uncertainty that would otherwise be
+            # discarded. Callers may ignore the third element.
+            kept = flow_predictions[-keep_iters:] if keep_iters else []
+            return coords1 - coords0, flow_up, kept
+
         return flow_predictions

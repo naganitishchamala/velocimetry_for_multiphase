@@ -14,3 +14,13 @@ results/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+# Model weights (large binaries; download separately)
+weights/*.pth
+
+# Test and build artefacts
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.coverage

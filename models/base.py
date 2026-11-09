@@ -1,25 +1,23 @@
 from abc import ABC, abstractmethod
 
+
 class BaseOpticalFlowModel(ABC):
-    """
-    Abstract base interface for all dense optical flow models.
-    """
-    
+    """Interface implemented by every dense optical flow backend."""
+
     @abstractmethod
     def __init__(self, device='cpu', **kwargs):
         self.device = device
-        
+
     @abstractmethod
     def predict_batch(self, image1_batch, image2_batch):
         """
-        Receives a batch of images and returns optical flow maps.
-        
+        Estimate flow and its uncertainty for a batch of frame pairs.
+
         Args:
-            image1_batch: PyTorch tensor (B, 3, H, W)
-            image2_batch: PyTorch tensor (B, 3, H, W)
-            
+            image1_batch, image2_batch: (B, 3, H, W) float tensors on the 0-255 scale.
+
         Returns:
-            Tuple of (flow_batch, uncertainty_batch) 
-            where each is a numpy.ndarray of shape (B, H, W, 2)
+            (flow_batch, uncertainty) where ``flow_batch`` is a (B, H, W, 2)
+            numpy array of pixel displacements and ``uncertainty`` is an
+            :class:`~pipeline_utils.uncertainty.UncertaintyResult`.
         """
-        pass

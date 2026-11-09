@@ -10,9 +10,11 @@ from .base import BaseOpticalFlowModel
 from pipeline_utils.uncertainty import compute_uncertainty_batch
 
 class OpenPIVModel(BaseOpticalFlowModel):
-    def __init__(self, **kwargs):
+    def __init__(self, uncert_window=8, uncert_max_shift=None, **kwargs):
         # OpenPIV natively runs on CPU.
         super().__init__(device='cpu')
+        self.uncert_window = uncert_window
+        self.uncert_max_shift = uncert_max_shift
         
         # Match pivLabrun.m settings
         self.settings = PIVSettings()
@@ -48,28 +50,43 @@ class OpenPIVModel(BaseOpticalFlowModel):
         v = np.ma.masked_array(v, np.isnan(v))
         
         # Iterations 2..N (Deformation)
+        flags = None
         for i in range(1, self.settings.num_iterations):
             x, y, u, v, grid_mask, flags = multipass_img_deform(
                 img1, img2, i, x, y, u, v, self.settings
             )
-            
-        return x, y, u, v
+
+        # OpenPIV's own outlier flags are a validated per-vector quality signal;
+        # keep them so invalid vectors can be excluded downstream.
+        return x, y, u, v, flags
             
     def _process_single_frame(self, b, image1_np, image2_np, h, w):
-        gray1 = cv2.cvtColor(image1_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        gray2 = cv2.cvtColor(image2_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        
-        x_pts, y_pts, u_pts, v_pts = self.process_pair(gray1, gray2)
-        
+        gray1 = np.clip(image1_np[:, :, 0], 0, 255).round().astype(np.uint8)
+        gray2 = np.clip(image2_np[:, :, 0], 0, 255).round().astype(np.uint8)
+
+        x_pts, y_pts, u_pts, v_pts, flags = self.process_pair(gray1, gray2)
+
+        u_flat = np.ma.filled(u_pts, np.nan).flatten()
+        v_flat = np.ma.filled(v_pts, np.nan).flatten()
         points = np.column_stack((x_pts.flatten(), y_pts.flatten()))
-        u_flat = u_pts.flatten()
-        v_flat = v_pts.flatten()
-        
+
+        # Drop vectors OpenPIV flagged as outliers, plus any that are already NaN.
+        good = np.isfinite(u_flat) & np.isfinite(v_flat)
+        if flags is not None:
+            good &= ~np.asarray(flags).flatten().astype(bool)
+        if not good.any():
+            nan_field = np.full((h, w), np.nan)
+            return b, nan_field, nan_field.copy()
+
         grid_y, grid_x = np.mgrid[0:h, 0:w]
-        
-        u_dense = griddata(points, u_flat, (grid_x, grid_y), method='linear', fill_value=0)
-        v_dense = griddata(points, v_flat, (grid_x, grid_y), method='linear', fill_value=0)
-        
+
+        # NaN outside the convex hull rather than a fabricated zero velocity:
+        # an unmeasured point must not enter the statistics as if it were data.
+        u_dense = griddata(points[good], u_flat[good], (grid_x, grid_y),
+                           method='linear', fill_value=np.nan)
+        v_dense = griddata(points[good], v_flat[good], (grid_x, grid_y),
+                           method='linear', fill_value=np.nan)
+
         return b, u_dense, v_dense
     def predict_batch(self, image1_batch, image2_batch):
         """
@@ -114,8 +131,13 @@ class OpenPIVModel(BaseOpticalFlowModel):
                 flow_out[b_idx, :, :, 0] = u_dense
                 flow_out[b_idx, :, :, 1] = v_dense
             
-        # Compute uncertainty on the CPU
-        flow_tensor = torch.from_numpy(flow_out).permute(0, 3, 1, 2)
-        uncert_out = compute_uncertainty_batch(image1_batch, image2_batch, flow_tensor, window_size=8)
-            
-        return flow_out, uncert_out
+        # The uncertainty estimator needs a finite flow field to warp with;
+        # substitute zero there but record those points as invalid.
+        finite = np.isfinite(flow_out).all(axis=-1)
+        flow_tensor = torch.from_numpy(np.nan_to_num(flow_out)).permute(0, 3, 1, 2)
+        uncertainty = compute_uncertainty_batch(
+            image1_batch, image2_batch, flow_tensor,
+            window_size=self.uncert_window, max_shift=self.uncert_max_shift)
+        uncertainty = uncertainty._replace(valid=uncertainty.valid & finite)
+
+        return flow_out, uncertainty

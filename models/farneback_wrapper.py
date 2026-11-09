@@ -6,9 +6,12 @@ from .base import BaseOpticalFlowModel
 from pipeline_utils.uncertainty import compute_uncertainty_batch
 
 class FarnebackOpticalFlow(BaseOpticalFlowModel):
-    def __init__(self, **kwargs):
-        # Farneback natively runs on CPU via OpenCV Python bindings.
+    """OpenCV's Farneback dense optical flow. CPU only."""
+
+    def __init__(self, uncert_window=8, uncert_max_shift=None, **kwargs):
         super().__init__(device='cpu')
+        self.uncert_window = uncert_window
+        self.uncert_max_shift = uncert_max_shift
 
     def predict_batch(self, image1_batch, image2_batch):
         """
@@ -19,7 +22,7 @@ class FarnebackOpticalFlow(BaseOpticalFlowModel):
             image2_batch: PyTorch tensor (B, 3, H, W)
             
         Returns:
-            numpy.ndarray of shape (B, H, W, 2)
+            (flow_batch, uncertainty) - see BaseOpticalFlowModel.
         """
         # Convert PyTorch Tensors (B, 3, H, W) back to numpy (B, H, W, 3) 
         # and from RGB to Grayscale for cv2.calcOpticalFlowFarneback
@@ -30,9 +33,10 @@ class FarnebackOpticalFlow(BaseOpticalFlowModel):
         image2_np = image2_batch.permute(0, 2, 3, 1).numpy()
         
         for b in range(batch_size):
-            # Convert RGB to Grayscale (Note: our tensor was [0, 255] float)
-            gray1 = cv2.cvtColor(image1_np[b].astype(np.uint8), cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(image2_np[b].astype(np.uint8), cv2.COLOR_RGB2GRAY)
+            # The tensor holds three identical channels on a 0-255 float scale;
+            # take one and round rather than truncating with astype(uint8).
+            gray1 = np.clip(image1_np[b, :, :, 0], 0, 255).round().astype(np.uint8)
+            gray2 = np.clip(image2_np[b, :, :, 0], 0, 255).round().astype(np.uint8)
             
             flow = cv2.calcOpticalFlowFarneback(
                 gray1, gray2, None, 
@@ -41,8 +45,9 @@ class FarnebackOpticalFlow(BaseOpticalFlowModel):
             )
             flow_out[b] = flow
             
-        # Compute uncertainty on the CPU
         flow_tensor = torch.from_numpy(flow_out).permute(0, 3, 1, 2)
-        uncert_out = compute_uncertainty_batch(image1_batch, image2_batch, flow_tensor, window_size=8)
-            
-        return flow_out, uncert_out
+        uncertainty = compute_uncertainty_batch(
+            image1_batch, image2_batch, flow_tensor,
+            window_size=self.uncert_window, max_shift=self.uncert_max_shift)
+
+        return flow_out, uncertainty

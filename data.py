@@ -1,16 +1,83 @@
+"""Frame-pair dataset for optical flow over video files."""
+
 import cv2
 import numpy as np
-import torch
 from torch.utils.data import Dataset
-from pipeline_utils.preprocessing import crop_frame, apply_clahe, prepare_bgr_to_tensor, rotate_frame
+
+from pipeline_utils.preprocessing import (
+    crop_frame, apply_clahe, prepare_bgr_to_tensor, rotate_frame, scale_to_8bit_range,
+)
+
+
+class _SequentialVideoReader:
+    """
+    Reads frames from a video, keeping one capture open.
+
+    Frame-accurate seeking is unreliable on inter-frame-compressed containers:
+    ``CAP_PROP_POS_FRAMES`` may land on a nearby keyframe, silently pairing the
+    wrong frames.  Because the tracker consumes indices in order, this reader
+    decodes sequentially and only falls back to a seek when asked to jump
+    backwards or far forwards.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise FileNotFoundError(f"Could not open video: {path}")
+        self.next_index = 0
+        self._cache_index = None
+        self._cache_frame = None
+
+    def frame_count(self):
+        return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def _read_next(self):
+        ok, frame = self.cap.read()
+        if not ok:
+            raise IndexError(f"Failed to read frame {self.next_index} from {self.path}")
+        self.next_index += 1
+        return frame
+
+    def frame(self, idx):
+        if idx == self._cache_index:
+            return self._cache_frame
+
+        if idx < self.next_index or idx - self.next_index > 32:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self.next_index = idx
+
+        while self.next_index < idx:
+            self._read_next()
+
+        frame = self._read_next()
+        self._cache_index = idx
+        self._cache_frame = frame
+        return frame
+
+    def pair(self, idx):
+        """Frames ``idx`` and ``idx + 1``, decoded consecutively."""
+        first = self.frame(idx)
+        second = self.frame(idx + 1)
+        return first, second
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
 
 class VideoPairDataset(Dataset):
     """
-    A PyTorch Dataset that yields (image1, image2, index) pairs for optical flow processing.
-    It reads frames directly from a video file and applies optional rotation, cropping + CLAHE.
+    Yields ``(image1, image2, index)`` for consecutive frame pairs.
+
+    Applies optional rotation, cropping and CLAHE, in that order, so the ROI is
+    taken from an already-levelled image.
     """
-    def __init__(self, video_path, roi=(0, -1, 0, -1), use_clahe=False, clahe_clip_limit=2.0, clahe_tile_size=8, max_frames=-1,
-                 rotate_angle=0.0, rotate_center=None):
+
+    def __init__(self, video_path, roi=(0, -1, 0, -1), use_clahe=False,
+                 clahe_clip_limit=2.0, clahe_tile_size=8, max_frames=-1,
+                 rotate_angle=0.0, rotate_center=None, bit_depth=None):
         self.video_path = video_path
         self.roi = roi
         self.use_clahe = use_clahe
@@ -19,76 +86,83 @@ class VideoPairDataset(Dataset):
         self.max_frames = max_frames
         self.rotate_angle = rotate_angle
         self.rotate_center = rotate_center  # (y, x) or None
-        
-        self.is_cine = self.video_path.lower().endswith('.cine')
-        
+        self.bit_depth = bit_depth
+
+        self.is_cine = video_path.lower().endswith('.cine')
+        self._reader = None
+        self._cine = None
+
         if self.is_cine:
-            import pims
-            with pims.open(self.video_path) as v:
-                self.frame_count = len(v)
+            frames = len(self._open_cine())
         else:
-            # We need a dedicated Capture object per worker, but we only query this one for length
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                raise FileNotFoundError(f"Could not open {self.video_path}")
-                
-            self.frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
-        
-        # Determine valid pairs (N-1 pairs)
-        if self.max_frames > 0:
-            self.frame_count = min(self.frame_count, self.max_frames)
-            
+            reader = _SequentialVideoReader(video_path)
+            frames = reader.frame_count()
+            reader.close()
+
+        if frames <= 1:
+            raise ValueError(f"{video_path} contains {frames} frame(s); need at least 2.")
+
+        self.frame_count = min(frames, max_frames) if max_frames > 0 else frames
         self.length = max(0, self.frame_count - 1)
+
+    def _open_cine(self):
+        if self._cine is None:
+            try:
+                import pims
+            except ImportError as exc:
+                raise ImportError(
+                    "Reading .cine files requires the 'pims' package: pip install pims"
+                ) from exc
+            self._cine = pims.open(self.video_path)
+        return self._cine
 
     def __len__(self):
         return self.length
 
     def preprocess(self, frame_raw):
-        is_grayscale = (len(frame_raw.shape) == 2)
-        
-        # For grayscale 12-bit .cine: scale to 8-bit before rotation
-        if is_grayscale and frame_raw.dtype == np.uint16:
-            frame_raw = np.clip((frame_raw.astype(np.float32) / 4095.0) * 255.0, 0, 255).astype(np.uint8)
-        
-        # Rotate BEFORE cropping so ROI operates on aligned image
+        is_grayscale = (frame_raw.ndim == 2)
+
+        if is_grayscale:
+            # Float 0-255: keeps the sensor's full dynamic range through
+            # rotation and CLAHE instead of quantising to 8 bits up front.
+            frame_raw = scale_to_8bit_range(frame_raw, self.bit_depth)
+
         if self.rotate_angle != 0.0 and self.rotate_center is not None:
             frame_raw = rotate_frame(frame_raw, self.rotate_center, self.rotate_angle)
-        
+
         frame = crop_frame(frame_raw, self.roi)
-        
+
         if self.use_clahe:
-            frame = apply_clahe(frame, self.clahe_clip_limit, self.clahe_tile_size, is_grayscale=is_grayscale)
-            
+            frame = apply_clahe(frame, self.clahe_clip_limit, self.clahe_tile_size,
+                                is_grayscale=is_grayscale)
+
         return prepare_bgr_to_tensor(frame, is_grayscale=is_grayscale)
 
     def __getitem__(self, idx):
-        """
-        Warning: For `num_workers > 0`, opening cv2.VideoCapture inside `__getitem__` safely isolates instances.
-        If speed becomes a random access bottleneck, we will need to load the video entirely into RAM 
-        or use advanced FFmpeg sequencers.
-        """
+        if idx >= self.length:
+            raise IndexError(f"index {idx} out of range for {self.length} pairs")
+
         if self.is_cine:
-            import pims
-            with pims.open(self.video_path) as v:
-                if idx + 1 >= len(v):
-                    raise IndexError(f"Failed to read frame pair at index {idx} - End of CINE.")
-                # Native pims parsing to dense numpy arrays
-                frame1_raw = v[idx]
-                frame2_raw = v[idx + 1]
+            video = self._open_cine()
+            frame1_raw = np.asarray(video[idx])
+            frame2_raw = np.asarray(video[idx + 1])
         else:
-            cap = cv2.VideoCapture(self.video_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx) # Seek to Frame t
-            
-            ret1, frame1_raw = cap.read()
-            ret2, frame2_raw = cap.read() # Frame t+1
-            cap.release()
-    
-            if not ret1 or not ret2:
-                raise IndexError(f"Failed to read frame pair at index {idx}")
+            if self._reader is None:
+                self._reader = _SequentialVideoReader(self.video_path)
+            frame1_raw, frame2_raw = self._reader.pair(idx)
 
-        image1 = self.preprocess(frame1_raw)
-        image2 = self.preprocess(frame2_raw)
+        return self.preprocess(frame1_raw), self.preprocess(frame2_raw), idx
 
-        return image1, image2, idx
+    def close(self):
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+        if self._cine is not None:
+            self._cine.close()
+            self._cine = None
 
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

@@ -2,7 +2,7 @@
 # 
 #SBATCH -t 0-01:00:00 
 #SBATCH -N 1
-#SBACTH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
 #SBATCH --account=cavitation
 #SBATCH --partition=a30_normal_q
