@@ -68,6 +68,10 @@ def main():
                         help="Deprecated. Align the field at tracking time with "
                              "tracker.py --rotate_angle; a non-zero value here is an error.")
     parser.add_argument('--frame', type=int, default=None, help="Extract profiles at a specific instantaneous frame instead of time-averaged.")
+    parser.add_argument('--valid_only', action='store_true',
+                        help="Profiles: average only samples that passed the residual check "
+                             "(valid_fraction > 0.5) and report sqrt(bias^2 + var_random/N_eff). "
+                             "Default: every frame and block, band = RMS residual.")
     
     parser.add_argument('--plot', action='store_true', help="Generate and save PNG plots for analytical flags like --frequency, --cavity, or --profiles")
 
@@ -239,12 +243,14 @@ def main():
             print(f"\n[6] Extracting time-averaged velocity profiles at X = {args.profiles} mm")
             
         results, lines_h5_path = extract_line_profiles(
-            args.h5, args.profiles, angle_deg=args.angle, frame_idx=args.frame)
+            args.h5, args.profiles, angle_deg=args.angle, frame_idx=args.frame,
+            valid_only=args.valid_only)
 
         print(f"    --> Saved line extractions to: {lines_h5_path}")
         for x_wall, data in results.items():
             n = data['n_samples']
-            print(f"        X = {x_wall} mm | {int(np.nanmedian(n))} valid samples (median over the profile)")
+            kind = 'valid samples' if args.valid_only else 'samples'
+            print(f"        X = {x_wall} mm | {int(np.nanmedian(n))} {kind} (median over the profile)")
         
     if not (args.quiver or args.contour or args.spacetime or args.frequency
             or args.cavity or args.profiles or args.average or args.profile_video):

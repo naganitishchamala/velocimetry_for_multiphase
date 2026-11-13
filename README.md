@@ -260,6 +260,21 @@ This generates a lighter-weight `_lines.h5` containing the profiles, their
 uncertainties, and the calibration and provenance of the source file. Station
 positions come from the `throat_loc_px` recorded at tracking time.
 
+By default every frame and every vector block enters the time average (only
+non-finite samples, such as OpenPIV gaps, are left out), and the band
+`mean_velocity_uncertainty` is the root-mean-square residual
+`sqrt(mean(sigma^2))`, which treats the whole residual as systematic. When the
+file carries the signed residual, the bias-plus-averaged-random estimate
+`sqrt(bias^2 + var_random / N_eff)` over the same frames is written alongside as
+`mean_velocity_uncertainty_averaged`.
+
+Add `--valid_only` to average only the samples that passed the residual check
+(`valid_fraction > 0.5`) and to report `sqrt(bias^2 + var_random / N_eff)` as the
+band. That excludes the blocks within the uncertainty margin
+(`uncert_search + uncert_window`, 12 px by default) of every frame edge, and the
+individual frames in which the residual could not be measured, so the mean
+becomes conditional on that check.
+
 ### 4. Making figures
 
 Figure generation is deliberately **not** part of this repository. `tracker.py`
@@ -317,8 +332,10 @@ recomputing it.
 **Validity.** The uncertainty estimator returns a number everywhere, including
 where it has no information: decorrelated regions such as vapour cores, residual
 errors larger than the search window, and reflection-padded frame borders. Those
-points are flagged in `valid_fraction` and **must** be excluded from statistics.
-`postprocess.velocity` does this; anything you write should too.
+points are flagged in `valid_fraction`, and they carry no meaningful
+uncertainty. `compute_time_average_fields` excludes them. Line profiles keep
+them by default, because the flag describes the residual rather than the
+velocity, and drop them with `--valid_only` (see Spatial Line Extractions).
 
 ---
 

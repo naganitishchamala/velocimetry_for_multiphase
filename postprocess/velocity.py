@@ -366,7 +366,8 @@ def compute_time_average_fields(h5_filepath, frame_start=None, frame_end=None,
 
 
 def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=None,
-                          output_path=None, estimate_timescale=True):
+                          output_path=None, estimate_timescale=True,
+                          valid_only=False):
     """
     Extract wall-normal profiles at the requested downstream stations.
 
@@ -374,6 +375,26 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
     as vertical columns, linearly interpolated between the two nearest grid
     columns; the field is assumed already aligned by ``--rotate_angle`` at
     tracking time.
+
+    Two ways of forming the profile, chosen by *valid_only*:
+
+    ``valid_only=False`` (default)
+        Every frame and every block enters the mean; only non-finite samples
+        (OpenPIV gaps) are left out.  ``mean_velocity_uncertainty`` is the
+        root-mean-square residual, ``sqrt(mean(sigma^2))``, which treats the
+        whole residual as systematic and does not shrink with record length.
+        This is the convention of the published profiles.  The bias/random
+        estimate ``sqrt(bias^2 + var_random / N_eff)`` over the same frames is
+        written alongside as ``mean_velocity_uncertainty_averaged`` when the
+        file carries the signed residual.
+
+    ``valid_only=True``
+        Only samples whose block passed the residual check
+        (``valid_fraction > 0.5``) enter the mean.  This drops the blocks within
+        the uncertainty margin of the frame edge in every frame, and drops
+        individual frames where the residual could not be measured, so the mean
+        becomes conditional on that check.  ``mean_velocity_uncertainty`` is
+        ``sqrt(bias^2 + var_random / N_eff)``.
 
     Writes a ``*_lines.h5`` carrying the profiles, their uncertainties, and the
     calibration and provenance of the source file.
@@ -446,11 +467,21 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
                 var_v = (var[:, :, j0, 1] * w0 ** 2 + var[:, :, j1, 1] * w1 ** 2) * scale ** 2
                 res_u = col(residual, 0) * scale
                 res_v = -col(residual, 1) * scale
-                w = (valid[:, :, j0] & valid[:, :, j1]).astype(np.float64)
+
+                # Non-finite samples (OpenPIV gaps) never enter the sums; a NaN
+                # times a zero weight would still poison them.
+                finite = np.ones(u.shape, dtype=bool)
+                for a in (u, v, var_u, var_v, res_u, res_v):
+                    finite &= np.isfinite(a)
+                keep = finite & valid[:, :, j0] & valid[:, :, j1] if valid_only else finite
+                w = keep.astype(np.float64)
+                u_t = np.where(finite, u, 0.0)
+                u, v, var_u, var_v, res_u, res_v = (
+                    np.where(keep, a, 0.0) for a in (u, v, var_u, var_v, res_u, res_v))
 
                 accs[li].add(u, v, var_u, var_v, res_u, res_v, w)
                 if estimate_timescale and frame_idx is None and buffered < TIMESCALE_MAX_FRAMES:
-                    series[li].append(u)
+                    series[li].append(u_t)
             if estimate_timescale and frame_idx is None:
                 buffered += chunk.shape[0]
 
@@ -459,7 +490,14 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
             tau = None
             if estimate_timescale and series[li]:
                 tau = integral_timescale(np.concatenate(series[li], axis=0))
-            per_line.append(accs[li].reduce(tau_u=tau, tau_v=tau))
+            res = accs[li].reduce(tau_u=tau, tau_v=tau)
+            if not valid_only:
+                # Published convention: the band is the RMS residual itself.
+                res['mean_u_uncert_averaged'] = res['mean_u_uncert']
+                res['mean_v_uncert_averaged'] = res['mean_v_uncert']
+                res['mean_u_uncert'] = res['precision_u']
+                res['mean_v_uncert'] = res['precision_v']
+            per_line.append(res)
 
         if output_path is None:
             stem = os.path.splitext(h5_filepath)[0]
@@ -473,6 +511,9 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
             fout.attrs['coordinate_type'] = 'wall_normal'
             fout.attrs['source_file'] = os.path.basename(h5_filepath)
             fout.attrs['instantaneous'] = int(instantaneous)
+            fout.attrs['profile_samples'] = (
+                'valid only (valid_fraction > 0.5)' if valid_only
+                else 'all frames and blocks (non-finite samples excluded)')
             signed = bool(per_line[0]['has_signed_residual']) if per_line else False
             fout.attrs['has_signed_residual'] = int(signed)
             if not signed:
@@ -506,7 +547,16 @@ def extract_line_profiles(h5_filepath, x_positions_mm, angle_deg=0.0, frame_idx=
                     'mean_velocity_uncertainty',
                     data=np.stack([res['mean_u_uncert'], res['mean_v_uncert']], axis=1))
                 unc_ds.attrs['components'] = ['sigma_u_parallel', 'sigma_v_normal']
-                unc_ds.attrs['definition'] = 'sqrt(bias^2 + var_random / N_eff)'
+                unc_ds.attrs['definition'] = (
+                    'sqrt(bias^2 + var_random / N_eff)' if valid_only
+                    else 'sqrt(mean(sigma^2)), whole residual treated as systematic')
+
+                if not valid_only and res['has_signed_residual']:
+                    avg_ds = grp.create_dataset(
+                        'mean_velocity_uncertainty_averaged',
+                        data=np.stack([res['mean_u_uncert_averaged'],
+                                       res['mean_v_uncert_averaged']], axis=1))
+                    avg_ds.attrs['definition'] = 'sqrt(bias^2 + var_random / N_eff)'
 
                 if res['has_signed_residual']:
                     grp.create_dataset(
