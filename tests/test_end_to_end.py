@@ -74,6 +74,47 @@ def test_profiles_carry_calibration_forward(synthetic_video):
             assert name in grp, f"missing profile dataset: {name}"
 
 
+def test_default_profiles_use_every_frame_and_the_rms_residual(synthetic_video):
+    """The published convention: all frames and blocks, band = sqrt(mean sigma^2)."""
+    from postprocess.velocity import extract_line_profiles
+    out = _run_tracker(synthetic_video)
+    with h5py.File(out, 'r') as f:
+        n_frames = f['velocity'].shape[0]
+        edge_invalid = not (f['valid_fraction'][:, -1, :] > 0.5).any()
+    _, lines_path = extract_line_profiles(out, [0.0], estimate_timescale=False)
+
+    with h5py.File(lines_path, 'r') as f:
+        assert 'all frames' in f.attrs['profile_samples']
+        grp = f['x_location_0_0']
+        n = grp['n_samples'][:]
+        band = grp['mean_velocity_uncertainty'][:, 0]
+        precision = grp['instantaneous_precision'][:, 0]
+        assert 'mean_velocity_uncertainty_averaged' in grp
+    # Every block contributes every frame, including the rows at the frame
+    # edge that the residual check always rejects.
+    assert edge_invalid
+    assert np.all(n == n_frames)
+    np.testing.assert_allclose(band, precision)
+
+
+def test_valid_only_profiles_drop_the_edge_band(synthetic_video):
+    from postprocess.velocity import extract_line_profiles
+    out = _run_tracker(synthetic_video)
+    # A station mid-frame (96 px at 0.05 mm/px), away from the left edge band.
+    _, lines_path = extract_line_profiles(
+        out, [2.4], estimate_timescale=False, valid_only=True,
+        output_path=out.replace('.h5', '_valid_lines.h5'))
+
+    with h5py.File(lines_path, 'r') as f:
+        assert 'valid only' in f.attrs['profile_samples']
+        grp = f['x_location_2_4']
+        n = grp['n_samples'][:]
+        u = grp['mean_velocity'][:, 0]
+        assert 'mean_velocity_uncertainty_averaged' not in grp
+    assert n[-1] == 0 and np.isnan(u[-1])      # row at the frame edge
+    assert n[len(n) // 2] > 0                   # row mid-frame
+
+
 def test_angle_argument_refuses_rather_than_silently_ignoring(synthetic_video):
     from postprocess.velocity import extract_line_profiles
     out = _run_tracker(synthetic_video)

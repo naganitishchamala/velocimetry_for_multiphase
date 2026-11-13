@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **Line profiles average every frame by default.** `extract_line_profiles`
+  (and `visualize_results.py --profiles`) now uses all frames and blocks, with
+  only non-finite samples left out, and reports `sqrt(mean(sigma^2))` as
+  `mean_velocity_uncertainty`. This is the convention of the published
+  profiles. The validity mask had made the mean conditional on the residual
+  check and removed the three blocks along each frame edge in every frame.
+  `--valid_only` (`valid_only=True`) restores the masked mean with
+  `sqrt(bias^2 + var_random / N_eff)`. In the default mode that estimate is
+  written as `mean_velocity_uncertainty_averaged`, and the file records the
+  choice in the `profile_samples` attribute.
+
 - **New `raft-cloudcav.pth` weights.** Fine-tuned from `raft-sintel.pth` on
   synthetic image pairs rendered from LES of the Venturi on the mid-plane and
   both quarter-planes, trained on the first four fifths of the time steps
